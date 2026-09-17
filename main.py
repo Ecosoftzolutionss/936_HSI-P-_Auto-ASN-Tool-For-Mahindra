@@ -1,105 +1,195 @@
 import sys
+import threading
 
 from PyQt6.QtWidgets import QApplication, QMainWindow
 
 from login import LoginPage
 from dashboard import DashboardPage
 
+# =============================================================
+# EXCEL PREPARATION SCHEDULER
+# =============================================================
+
+from excelprepare import run_scheduler
+
 
 class HSIApplication(QMainWindow):
-    """
-    Main application window for HSI Automation Portal.
-
-    Flow:
-        LoginPage
-            ↓
-        Successful Login
-            ↓
-        DashboardPage
-            ↓
-        Logout
-            ↓
-        LoginPage
-    """
 
     def __init__(self):
         super().__init__()
 
-        # =========================================================
-        # WINDOW CONFIGURATION
-        # =========================================================
+        self.setWindowTitle("HSI Automation Portal")
 
-        self.setWindowTitle(
-            "HSI Automation Portal"
-        )
+        self.resize(1347, 758)
 
-        self.resize(
-            1347,
-            758
-        )
+        self.setMinimumSize(1100, 620)
 
-        self.setMinimumSize(
-            1100,
-            620
-        )
-
-        # =========================================================
+        # =====================================================
         # PAGE REFERENCES
-        # =========================================================
+        # =====================================================
 
         self.login_page = None
         self.dashboard = None
 
-        # =========================================================
-        # SHOW LOGIN PAGE
-        # =========================================================
+        # =====================================================
+        # EXCEL PREPARATION SCHEDULER
+        #
+        # Starts automatically when application starts.
+        #
+        # Excel preparation:
+        #   - Runs immediately
+        #   - Checks DB
+        #   - Creates Pending CSV when new data exists
+        #   - Waits 20 minutes
+        #   - Runs again
+        #
+        # It runs independently from Login/Dashboard.
+        # =====================================================
+
+        self.excel_scheduler_thread = None
+
+        self.start_excel_scheduler()
+
+        # =====================================================
+        # SHOW LOGIN
+        # =====================================================
 
         self.show_login()
 
     # =============================================================
-    # SHOW LOGIN PAGE
+    # START EXCEL PREPARATION
+    # =============================================================
+
+    def start_excel_scheduler(self):
+
+        try:
+
+            # Prevent accidental duplicate scheduler threads
+            if (
+                self.excel_scheduler_thread is not None
+                and self.excel_scheduler_thread.is_alive()
+            ):
+                print(
+                    "Excel preparation scheduler is already running."
+                )
+                return
+
+            print(
+                "=============================================="
+            )
+
+            print(
+                "STARTING EXCEL PREPARATION SCHEDULER"
+            )
+
+            print(
+                "=============================================="
+            )
+
+            self.excel_scheduler_thread = threading.Thread(
+                target=self.run_excel_scheduler,
+                name="ExcelPreparationScheduler",
+                daemon=True
+            )
+
+            self.excel_scheduler_thread.start()
+
+            print(
+                "Excel preparation scheduler started."
+            )
+
+        except Exception as error:
+
+            print(
+                "Excel scheduler start error:",
+                repr(error)
+            )
+
+    # =============================================================
+    # EXCEL SCHEDULER THREAD
+    # =============================================================
+
+    @staticmethod
+    def run_excel_scheduler():
+
+        try:
+
+            print(
+                "Excel preparation background thread started."
+            )
+
+            # This function already handles:
+            #
+            # 1. Immediate execution
+            # 2. DB checking
+            # 3. CSV creation
+            # 4. Duplicate protection
+            # 5. 20-minute interval
+            #
+            run_scheduler()
+
+        except Exception as error:
+
+            print(
+                "Excel preparation scheduler error:",
+                repr(error)
+            )
+
+    # =============================================================
+    # LOGIN
     # =============================================================
 
     def show_login(self):
-        """
-        Display the Login page.
-
-        This method is also used as the logout callback
-        from the Dashboard.
-        """
 
         # ---------------------------------------------------------
-        # Remove Dashboard
+        # CLOSE EXISTING DASHBOARD
         # ---------------------------------------------------------
 
         if self.dashboard is not None:
 
-            self.dashboard.deleteLater()
+            try:
+
+                self.dashboard.close_automation()
+
+            except Exception as error:
+
+                print(
+                    "Dashboard automation cleanup error:",
+                    repr(error)
+                )
+
+            try:
+
+                self.dashboard.deleteLater()
+
+            except Exception:
+                pass
 
             self.dashboard = None
 
         # ---------------------------------------------------------
-        # Remove Existing Login Page
+        # REMOVE EXISTING LOGIN PAGE
         # ---------------------------------------------------------
 
         if self.login_page is not None:
 
-            self.login_page.deleteLater()
+            try:
+
+                self.login_page.deleteLater()
+
+            except Exception:
+                pass
 
             self.login_page = None
 
         # ---------------------------------------------------------
-        # Create New Login Page
+        # CREATE LOGIN PAGE
         # ---------------------------------------------------------
 
         self.login_page = LoginPage(
             self,
             self.login_success
         )
-
-        # ---------------------------------------------------------
-        # Set Login Page as Central Widget
-        # ---------------------------------------------------------
 
         self.setCentralWidget(
             self.login_page
@@ -110,14 +200,6 @@ class HSIApplication(QMainWindow):
     # =============================================================
 
     def login_success(self, user):
-        """
-        Called after successful login.
-
-        Parameters
-        ----------
-        user:
-            Logged-in user information received from LoginPage.
-        """
 
         print(
             "Logged in:",
@@ -125,17 +207,22 @@ class HSIApplication(QMainWindow):
         )
 
         # ---------------------------------------------------------
-        # Remove Login Page
+        # REMOVE LOGIN PAGE
         # ---------------------------------------------------------
 
         if self.login_page is not None:
 
-            self.login_page.deleteLater()
+            try:
+
+                self.login_page.deleteLater()
+
+            except Exception:
+                pass
 
             self.login_page = None
 
         # ---------------------------------------------------------
-        # Create Dashboard
+        # CREATE DASHBOARD
         # ---------------------------------------------------------
 
         self.dashboard = DashboardPage(
@@ -144,103 +231,112 @@ class HSIApplication(QMainWindow):
             self.show_login
         )
 
-        # ---------------------------------------------------------
-        # Set Dashboard as Central Widget
-        # ---------------------------------------------------------
-
         self.setCentralWidget(
             self.dashboard
         )
 
     # =============================================================
-    # CLOSE EVENT
+    # CLOSE APPLICATION
     # =============================================================
 
     def closeEvent(self, event):
-        """
-        Cleanly close the application.
-        """
+
+        print(
+            "Closing HSI Automation Portal..."
+        )
 
         # ---------------------------------------------------------
-        # Clean Dashboard
+        # CLOSE DASHBOARD AUTOMATION
         # ---------------------------------------------------------
 
         if self.dashboard is not None:
 
             try:
+
+                self.dashboard.close_automation()
+
+            except Exception as error:
+
+                print(
+                    "Automation cleanup error:",
+                    repr(error)
+                )
+
+            try:
+
                 self.dashboard.deleteLater()
+
             except Exception:
                 pass
 
             self.dashboard = None
 
         # ---------------------------------------------------------
-        # Clean Login Page
+        # CLEAN LOGIN PAGE
         # ---------------------------------------------------------
 
         if self.login_page is not None:
 
             try:
+
                 self.login_page.deleteLater()
+
             except Exception:
                 pass
 
             self.login_page = None
 
         # ---------------------------------------------------------
-        # Accept Close Event
+        # EXCEL SCHEDULER
+        #
+        # The Excel scheduler is a daemon thread.
+        # It will automatically stop when the main EXE exits.
         # ---------------------------------------------------------
+
+        if self.excel_scheduler_thread is not None:
+
+            print(
+                "Excel preparation scheduler will stop "
+                "with the application."
+            )
 
         event.accept()
 
 
-# ================================================================
+# =============================================================
 # APPLICATION ENTRY POINT
-# ================================================================
+# =============================================================
 
 def main():
-    """
-    Start the HSI Automation Portal application.
-    """
 
-    # ------------------------------------------------------------
-    # Create QApplication
-    # ------------------------------------------------------------
-
-    app = QApplication(
-        sys.argv
+    print(
+        "=============================================="
     )
 
-    # ------------------------------------------------------------
-    # Application Style
-    # ------------------------------------------------------------
+    print(
+        "HSI AUTOMATION PORTAL"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    app = QApplication(sys.argv)
 
     app.setStyle(
         "Fusion"
     )
 
-    # ------------------------------------------------------------
-    # Create Main Window
-    # ------------------------------------------------------------
-
     window = HSIApplication()
 
-    # ------------------------------------------------------------
-    # Show Main Window
-    # ------------------------------------------------------------
-
     window.show()
-
-    # ------------------------------------------------------------
-    # Start Qt Event Loop
-    # ------------------------------------------------------------
 
     return app.exec()
 
 
-# ================================================================
-# RUN APPLICATION
-# ================================================================
+# =============================================================
+# RUN
+# =============================================================
 
 if __name__ == "__main__":
 
