@@ -1,877 +1,42 @@
+import bcrypt
 from pathlib import Path
 
-import bcrypt
-
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon, QPixmap
+from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from database import get_connection
+from support_tool import SupportTool
 
 
-class Toast(QWidget):
-    """Small top-right toast notification."""
+class LoginWorker(QObject):
+    success = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
 
-    def __init__(self, parent, message, message_type="success", duration=2500):
-        super().__init__(parent)
+    def __init__(self, username, password):
+        super().__init__()
+        self.username = username
+        self.password = password
 
-        self.duration = duration
-        self.setFixedSize(360, 76)
-
-        colors = {
-            "success": ("Success", "✓", "#22C55E"),
-            "error": ("Error", "!", "#EF4444"),
-            "warning": ("Warning", "!", "#F59E0B"),
-        }
-
-        title, icon_text, border_color = colors.get(
-            message_type,
-            colors["warning"],
-        )
-
-        self.setStyleSheet(
-            """
-            Toast {
-                background-color: #FFFFFF;
-                border: 1px solid #E5E7EB;
-                border-radius: 8px;
-            }
-            """
-        )
-
-        # Icon circle
-        icon_frame = QFrame(self)
-        icon_frame.setGeometry(14, 19, 36, 36)
-        icon_frame.setStyleSheet(
-            f"""
-            QFrame {{
-                background-color: {border_color};
-                border-radius: 18px;
-            }}
-            """
-        )
-
-        icon_label = QLabel(icon_text, icon_frame)
-        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon_label.setGeometry(0, 0, 36, 36)
-        icon_label.setStyleSheet(
-            """
-            QLabel {
-                color: #FFFFFF;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 17px;
-                font-weight: 700;
-            }
-            """
-        )
-
-        # Title
-        title_label = QLabel(title, self)
-        title_label.setGeometry(62, 8, 245, 22)
-        title_label.setStyleSheet(
-            """
-            QLabel {
-                color: #1F2937;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 12px;
-                font-weight: 700;
-            }
-            """
-        )
-
-        # Message
-        message_label = QLabel(message, self)
-        message_label.setGeometry(62, 32, 260, 35)
-        message_label.setWordWrap(True)
-        message_label.setStyleSheet(
-            """
-            QLabel {
-                color: #6B7280;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 11px;
-            }
-            """
-        )
-
-        # Close button
-        close_button = QPushButton("×", self)
-        close_button.setGeometry(326, 6, 25, 25)
-        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_button.setStyleSheet(
-            """
-            QPushButton {
-                color: #9CA3AF;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 18px;
-                font-weight: 400;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #F3F4F6;
-            }
-            """
-        )
-        close_button.clicked.connect(self.close)
-
-        # Bottom progress line
-        progress = QFrame(self)
-        progress.setGeometry(0, 73, 360, 3)
-        progress.setStyleSheet(
-            f"""
-            QFrame {{
-                background-color: {border_color};
-                border: none;
-                border-radius: 0px;
-            }}
-            """
-        )
-
-        self.show()
-        self.raise_()
-
-        QTimer.singleShot(duration, self.close)
-
-
-class LoginPage(QWidget):
-    """PyQt6 version of the original CustomTkinter LoginPage."""
-
-    login_success_signal = pyqtSignal(object)
-
-    def __init__(self, master=None, login_success=None):
-        super().__init__(master)
-
-        self.login_success = login_success
-        self.show_password = False
-        self._toast = None
-
-        self.base_path = Path(__file__).resolve().parent
-        self.image_path = self.base_path / "assets" / "LOGIN.png"
-
-        self.original_pixmap = QPixmap(str(self.image_path))
-
-        if self.original_pixmap.isNull():
-            raise FileNotFoundError(
-                f"Unable to load login background image:\n{self.image_path}"
-            )
-
-        self.setMinimumSize(900, 600)
-        self.setStyleSheet("background-color: #EEF1FA;")
-
-        self.create_login_ui()
-
-        # Signal can also be used when LoginPage is used without a callback.
-        self.login_success_signal.connect(self._emit_login_success)
-
-        QTimer.singleShot(100, self.resize_background)
-
-    # =========================================================
-    # ICONS
-    # =========================================================
-
-    def create_icon(self, name):
-        """
-        Uses standard Unicode symbols so no Tkinter/CustomTkinter
-        or ctkfontawesome dependency is required.
-        """
-        icons = {
-            "lock": "🔒",
-            "user": "👤",
-            "eye": "◉",
-            "eye-slash": "◉",
-            "right-to-bracket": "→",
-        }
-        return icons.get(name, "")
-
-    def create_icon_label(self, text, color="#94A3B8", size=16):
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setFixedSize(24, 24)
-        label.setStyleSheet(
-            f"""
-            QLabel {{
-                color: {color};
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: {size}px;
-            }}
-            """
-        )
-        return label
-
-    # =========================================================
-    # CREATE LOGIN UI
-    # =========================================================
-
-    def create_login_ui(self):
-
-        # -----------------------------------------------------
-        # TOP LOCK ICON
-        # -----------------------------------------------------
-
-        self.lock_circle = QFrame(self)
-        self.lock_circle.setFixedSize(48, 48)
-        self.lock_circle.setStyleSheet(
-            """
-            QFrame {
-                background-color: #F4F7FF;
-                border: 1px solid #2455D6;
-                border-radius: 24px;
-            }
-            """
-        )
-
-        lock_layout = QVBoxLayout(self.lock_circle)
-        lock_layout.setContentsMargins(0, 0, 0, 0)
-
-        lock_icon = QLabel(self.create_icon("lock"))
-        lock_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lock_icon.setStyleSheet(
-            """
-            QLabel {
-                color: #2455D6;
-                background: transparent;
-                border: none;
-                font-size: 21px;
-            }
-            """
-        )
-        lock_layout.addWidget(lock_icon)
-
-        # -----------------------------------------------------
-        # TITLE
-        # -----------------------------------------------------
-
-        self.title_label = QLabel("Login", self)
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setStyleSheet(
-            """
-            QLabel {
-                color: #101828;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 25px;
-                font-weight: 700;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # SUBTITLE
-        # -----------------------------------------------------
-
-        self.subtitle_label = QLabel(
-            "Enter your credentials to continue",
-            self,
-        )
-        self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.subtitle_label.setStyleSheet(
-            """
-            QLabel {
-                color: #7B8AA5;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 15px;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # USERNAME LABEL
-        # -----------------------------------------------------
-
-        self.username_label = QLabel("Username", self)
-        self.username_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.username_label.setStyleSheet(
-            """
-            QLabel {
-                color: #101828;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 14px;
-                font-weight: 700;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # USERNAME FIELD
-        # -----------------------------------------------------
-
-        self.username_field = QFrame(self)
-        self.username_field.setStyleSheet(
-            """
-            QFrame {
-                background-color: #F8FAFC;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-            }
-            """
-        )
-
-        username_layout = QHBoxLayout(self.username_field)
-        username_layout.setContentsMargins(8, 1, 8, 1)
-        username_layout.setSpacing(5)
-
-        username_icon = self.create_icon_label(
-            self.create_icon("user"),
-            "#94A3B8",
-            15,
-        )
-        username_layout.addWidget(username_icon)
-
-        self.username_entry = QLineEdit(self.username_field)
-        self.username_entry.setPlaceholderText("Enter username")
-        self.username_entry.setFixedHeight(42)
-        self.username_entry.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Fixed,
-        )
-        self.username_entry.setStyleSheet(
-            """
-            QLineEdit {
-                background: transparent;
-                border: none;
-                outline: none;
-                color: #101828;
-                font-family: "Segoe UI";
-                font-size: 13px;
-                padding: 0px;
-            }
-            QLineEdit:focus {
-                border: none;
-            }
-            """
-        )
-        username_layout.addWidget(self.username_entry)
-
-        # -----------------------------------------------------
-        # PASSWORD LABEL
-        # -----------------------------------------------------
-
-        self.password_label = QLabel("Password", self)
-        self.password_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.password_label.setStyleSheet(
-            """
-            QLabel {
-                color: #101828;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 14px;
-                font-weight: 700;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # PASSWORD FIELD
-        # -----------------------------------------------------
-
-        self.password_field = QFrame(self)
-        self.password_field.setStyleSheet(
-            """
-            QFrame {
-                background-color: #F8FAFC;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-            }
-            """
-        )
-
-        password_layout = QHBoxLayout(self.password_field)
-        password_layout.setContentsMargins(8, 1, 7, 1)
-        password_layout.setSpacing(5)
-
-        password_icon = self.create_icon_label(
-            self.create_icon("lock"),
-            "#94A3B8",
-            14,
-        )
-        password_layout.addWidget(password_icon)
-
-        self.password_entry = QLineEdit(self.password_field)
-        self.password_entry.setPlaceholderText("Enter password")
-        self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_entry.setFixedHeight(42)
-        self.password_entry.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Fixed,
-        )
-        self.password_entry.setStyleSheet(
-            """
-            QLineEdit {
-                background: transparent;
-                border: none;
-                outline: none;
-                color: #101828;
-                font-family: "Segoe UI";
-                font-size: 13px;
-                padding: 0px;
-            }
-            QLineEdit:focus {
-                border: none;
-            }
-            """
-        )
-        password_layout.addWidget(self.password_entry)
-
-        # -----------------------------------------------------
-        # SHOW / HIDE PASSWORD
-        # -----------------------------------------------------
-
-        self.eye_button = QPushButton(
-            self.create_icon("eye"),
-            self.password_field,
-        )
-        self.eye_button.setFixedSize(28, 28)
-        self.eye_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.eye_button.setStyleSheet(
-            """
-            QPushButton {
-                color: #94A3B8;
-                background: transparent;
-                border: none;
-                border-radius: 5px;
-                font-family: "Segoe UI";
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #E8EDF5;
-            }
-            """
-        )
-        password_layout.addWidget(self.eye_button)
-
-        self.eye_button.clicked.connect(self.toggle_password)
-
-        # -----------------------------------------------------
-        # LOGIN BUTTON
-        # -----------------------------------------------------
-
-        self.login_button = QPushButton(
-            f"{self.create_icon('right-to-bracket')}   Login",
-            self,
-        )
-        self.login_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.login_button.setFixedHeight(42)
-        self.login_button.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #2455D6;
-                color: #FFFFFF;
-                border: none;
-                border-radius: 7px;
-                font-family: "Segoe UI";
-                font-size: 12px;
-                font-weight: 700;
-            }
-            QPushButton:hover {
-                background-color: #1745C0;
-            }
-            QPushButton:pressed {
-                background-color: #123A9F;
-            }
-            """
-        )
-        self.login_button.clicked.connect(self.login)
-
-        # -----------------------------------------------------
-        # VERSION
-        # -----------------------------------------------------
-
-        self.version_label = QLabel("Version:1.0", self)
-        self.version_label.setStyleSheet(
-            """
-            QLabel {
-                color: #9AA1AC;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 9px;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # BUILD DATE
-        # -----------------------------------------------------
-
-        self.build_label = QLabel("Build Date:20-08-2026", self)
-        self.build_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.build_label.setStyleSheet(
-            """
-            QLabel {
-                color: #9AA1AC;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 9px;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # FOOTER
-        # -----------------------------------------------------
-
-        self.footer_label = QLabel(
-            "Powered By Ecosoft Solutions/Version 1.0",
-            self,
-        )
-        self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.footer_label.setStyleSheet(
-            """
-            QLabel {
-                color: #555555;
-                background: transparent;
-                border: none;
-                font-family: "Segoe UI";
-                font-size: 10px;
-            }
-            """
-        )
-
-        # -----------------------------------------------------
-        # KEYBOARD
-        # -----------------------------------------------------
-
-        self.username_entry.returnPressed.connect(
-            self.password_entry.setFocus
-        )
-
-        self.password_entry.returnPressed.connect(self.login)
-
-    # =========================================================
-    # TOGGLE PASSWORD
-    # =========================================================
-
-    def toggle_password(self):
-
-        if self.show_password:
-            self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
-            self.show_password = False
-            self.eye_button.setText(self.create_icon("eye"))
-        else:
-            self.password_entry.setEchoMode(QLineEdit.EchoMode.Normal)
-            self.show_password = True
-            self.eye_button.setText(self.create_icon("eye-slash"))
-
-    # =========================================================
-    # RESPONSIVE UI
-    # =========================================================
-
-    def position_ui(self):
-
-        width = self.width()
-        height = self.height()
-
-        if width < 100 or height < 100:
-            return
-
-        # Same relative login panel position as the original.
-        card_x = 0.785
-
-        login_width = int(width * 0.235)
-        login_width = max(300, login_width)
-        login_width = min(420, login_width)
-
-        # -----------------------------------------------------
-        # TOP LOCK
-        # -----------------------------------------------------
-
-        self.lock_circle.move(
-            int(width * card_x - self.lock_circle.width() / 2),
-            int(height * 0.205 - self.lock_circle.height() / 2),
-        )
-
-        # -----------------------------------------------------
-        # TITLE
-        # -----------------------------------------------------
-
-        title_width = max(login_width, 300)
-        self.title_label.setGeometry(
-            int(width * card_x - title_width / 2),
-            int(height * 0.270 - 20),
-            title_width,
-            40,
-        )
-
-        # -----------------------------------------------------
-        # SUBTITLE
-        # -----------------------------------------------------
-
-        self.subtitle_label.setGeometry(
-            int(width * card_x - title_width / 2),
-            int(height * 0.325 - 15),
-            title_width,
-            30,
-        )
-
-        # -----------------------------------------------------
-        # USERNAME LABEL
-        # -----------------------------------------------------
-
-        label_left = int(width * 0.671)
-
-        self.username_label.setGeometry(
-            label_left,
-            int(height * 0.380 - 12),
-            login_width,
-            25,
-        )
-
-        # -----------------------------------------------------
-        # USERNAME FIELD
-        # -----------------------------------------------------
-
-        self.username_field.setGeometry(
-            int(width * card_x - login_width / 2),
-            int(height * 0.427 - 23),
-            login_width,
-            46,
-        )
-
-        # -----------------------------------------------------
-        # PASSWORD LABEL
-        # -----------------------------------------------------
-
-        self.password_label.setGeometry(
-            label_left,
-            int(height * 0.501 - 12),
-            login_width,
-            25,
-        )
-
-        # -----------------------------------------------------
-        # PASSWORD FIELD
-        # -----------------------------------------------------
-
-        self.password_field.setGeometry(
-            int(width * card_x - login_width / 2),
-            int(height * 0.548 - 23),
-            login_width,
-            46,
-        )
-
-        # -----------------------------------------------------
-        # LOGIN BUTTON
-        # -----------------------------------------------------
-
-        self.login_button.setGeometry(
-            int(width * card_x - login_width / 2),
-            int(height * 0.647 - 21),
-            login_width,
-            42,
-        )
-
-        # -----------------------------------------------------
-        # VERSION
-        # -----------------------------------------------------
-
-        self.version_label.setGeometry(
-            int(width * 0.672),
-            int(height * 0.700 - 10),
-            max(100, login_width // 2),
-            20,
-        )
-
-        # -----------------------------------------------------
-        # BUILD DATE
-        # -----------------------------------------------------
-
-        self.build_label.setGeometry(
-            int(width * 0.878 - max(100, login_width // 2)),
-            int(height * 0.700 - 10),
-            max(100, login_width // 2),
-            20,
-        )
-
-        # -----------------------------------------------------
-        # FOOTER
-        # -----------------------------------------------------
-
-        footer_width = max(login_width, 300)
-        self.footer_label.setGeometry(
-            int(width * card_x - footer_width / 2),
-            int(height * 0.773 - 10),
-            footer_width,
-            25,
-        )
-
-        # Keep widgets above the background.
-        for widget in (
-            self.lock_circle,
-            self.title_label,
-            self.subtitle_label,
-            self.username_label,
-            self.username_field,
-            self.password_label,
-            self.password_field,
-            self.login_button,
-            self.version_label,
-            self.build_label,
-            self.footer_label,
-        ):
-            widget.raise_()
-
-        if self._toast is not None:
-            self._toast.raise_()
-
-    # =========================================================
-    # BACKGROUND RESIZE
-    # =========================================================
-
-    def resize_background(self, event=None):
-
-        width = self.width()
-        height = self.height()
-
-        if width < 100 or height < 100:
-            return
-
-        # Match the original behavior: stretch LOGIN.png to
-        # exactly fill the whole LoginPage.
-        resized = self.original_pixmap.scaled(
-            width,
-            height,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-
-        # A QLabel is used only for displaying the image.
-        if not hasattr(self, "background"):
-            self.background = QLabel(self)
-            self.background.setGeometry(0, 0, width, height)
-            self.background.setScaledContents(True)
-            self.background.setAttribute(
-                Qt.WidgetAttribute.WA_TransparentForMouseEvents,
-                True,
-            )
-
-        self.background.setPixmap(resized)
-        self.background.setGeometry(0, 0, width, height)
-        self.background.lower()
-
-        self.position_ui()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.resize_background(event)
-
-    # =========================================================
-    # TOAST MESSAGE
-    # =========================================================
-
-    def show_toast(
-        self,
-        message,
-        message_type="success",
-        duration=2500,
-    ):
-        """
-        Shows a small toast message on the top-right of the
-        application window.
-        """
-
-        if self._toast is not None:
-            try:
-                self._toast.close()
-                self._toast.deleteLater()
-            except RuntimeError:
-                pass
-
-            self._toast = None
-
-        root = self.window()
-
-        toast = Toast(
-            root,
-            message,
-            message_type,
-            duration,
-        )
-
-        margin_right = 15
-        margin_top = 20
-
-        toast.move(
-            root.width() - toast.width() - margin_right,
-            margin_top,
-        )
-
-        toast.raise_()
-        toast.show()
-
-        self._toast = toast
-
-        def clear_reference():
-            if self._toast is toast:
-                self._toast = None
-
-        QTimer.singleShot(duration + 100, clear_reference)
-
-        return toast
-
-    # =========================================================
-    # LOGIN
-    # =========================================================
-
-    def login(self):
-
-        username = self.username_entry.text().strip()
-        password = self.password_entry.text()
-
-        # -----------------------------------------------------
-        # VALIDATION
-        # -----------------------------------------------------
-
-        if not username:
-            self.show_toast(
-                "Please enter username.",
-                "warning",
-            )
-            self.username_entry.setFocus()
-            return
-
-        if not password:
-            self.show_toast(
-                "Please enter password.",
-                "warning",
-            )
-            self.password_entry.setFocus()
-            return
-
+    def run(self):
         connection = None
-
         try:
             connection = get_connection()
             cursor = connection.cursor()
 
-            cursor.execute(
-                """
-                SELECT
+            cursor.execute("""
+                SELECT TOP 1
                     UserId,
                     Username,
                     PasswordHash,
@@ -880,145 +45,639 @@ class LoginPage(QWidget):
                 FROM dbo.Users
                 WHERE Username = ?
                   AND IsActive = 1
-                """,
-                username,
-            )
+            """, self.username)
 
-            user = cursor.fetchone()
+            row = cursor.fetchone()
 
-            # -------------------------------------------------
-            # INVALID USERNAME
-            # -------------------------------------------------
-
-            if not user:
-                self.show_toast(
-                    "Invalid username or password.",
-                    "error",
-                )
-
-                self.password_entry.clear()
-                self.password_entry.setFocus()
+            if not row:
+                self.failed.emit("Invalid username or password.")
                 return
 
-            # -------------------------------------------------
-            # PASSWORD CHECK
-            # -------------------------------------------------
+            db_username = str(row[1] or "").strip()
+            db_role = str(row[3] or "").strip()
 
-            stored_hash = user.PasswordHash
+            # Application login is limited to users with the ADMIN role.
+            if db_role.lower() != "admin":
+                self.failed.emit(
+                    "Only users with the Admin role are allowed to log in."
+                )
+                return
+
+            stored_hash = str(row[2] or "").encode("utf-8")
 
             try:
-                if isinstance(stored_hash, bytes):
-                    hash_bytes = stored_hash
-                else:
-                    hash_bytes = str(stored_hash).encode("utf-8")
-
-                valid_password = bcrypt.checkpw(
-                    password.encode("utf-8"),
-                    hash_bytes,
+                valid = bcrypt.checkpw(
+                    self.password.encode("utf-8"),
+                    stored_hash,
                 )
+            except Exception:
+                valid = False
 
-            except (
-                ValueError,
-                AttributeError,
-                TypeError,
-            ):
-                valid_password = False
-
-            if not valid_password:
-
-                self.show_toast(
-                    "Invalid username or password.",
-                    "error",
-                )
-
-                self.password_entry.clear()
-                self.password_entry.setFocus()
+            if not valid:
+                self.failed.emit("Invalid username or password.")
                 return
 
-            # -------------------------------------------------
-            # LOGIN SUCCESS
-            # -------------------------------------------------
-
-            self.show_toast(
-                f"Welcome {user.Username}! Login successful.",
-                "success",
-                duration=1800,
-            )
-
-            # Keep the same behavior as the original:
-            # show success toast briefly, then open Dashboard.
-            QTimer.singleShot(
-                700,
-                lambda: self.login_success_signal.emit(user),
-            )
+            self.success.emit({
+                "user_id": int(row[0]),
+                "username": db_username,
+                "role": db_role,
+                "department": str(row[4] or ""),
+            })
 
         except Exception as error:
-
-            print("Login error:", error)
-
-            self.show_toast(
-                f"Unable to login: {error}",
-                "error",
-                duration=5000,
+            self.failed.emit(
+                f"Unable to validate login: {error}"
             )
 
         finally:
-
             if connection:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
+                connection.close()
+
+            self.finished.emit()
+
+
+class LoginPage(QWidget):
+    """
+    HSI Mahindra Auto ASN - Login / Process Control.
+
+    Left  : brand + ASN process control (Play works WITHOUT login)
+    Right : Admin login card + live activity log
+    """
+
+    LEVELS = {
+        "SUCCESS": ("\u2714", "#15803D"),
+        "ERROR": ("\u2716", "#DC2626"),
+        "WARNING": ("\u26A0", "#B45309"),
+        "INFO": ("\u25CF", "#1D4ED8"),
+    }
+
+    # Survives logout so the log is not lost when the page is rebuilt.
+    _history = []
+
+    @staticmethod
+    def _get_company_logo_path():
+        """Find the HSI AUTO company logo without hard-coding one machine path."""
+        base = Path(__file__).resolve().parent
+        assets = base / "assets"
+
+        preferred = [
+            "HSI_AUTO_logo.png",
+            "DashTopLogo.png",
+            "Dashtoplogo.png",
+            "Dashboardlogo.png",
+            "Dashlogo.png",
+            "HSIAUTO.png",
+            "HSI_AUTO.png",
+        ]
+
+        for name in preferred:
+            path = assets / name
+            if path.is_file():
+                return path
+
+        # Fall back to any image whose filename contains "logo".
+        if assets.is_dir():
+            for path in sorted(assets.iterdir()):
+                if (
+                    path.is_file()
+                    and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                    and "logo" in path.stem.lower()
+                ):
+                    return path
+
+        return None
+
+    @classmethod
+    def _logo_label(cls, max_width=170, max_height=58, dark=False):
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumHeight(max_height)
+
+        path = cls._get_company_logo_path()
+        if path:
+            pixmap = QPixmap(str(path))
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(
+                    max_width,
+                    max_height,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                label.setPixmap(scaled)
+                return label
+
+        label.setText("HSI AUTO")
+        label.setStyleSheet(
+            "color:white; font-size:22px; font-weight:800;"
+            if dark
+            else "color:#123A7A; font-size:22px; font-weight:800;"
+        )
+        return label
+
+    STYLE = """
+        QWidget { font-family: "Segoe UI"; color: #10182D; }
+        QLabel { background: transparent; border: none; }
+
+        #brandPanel {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 #1A63F2, stop:1 #0A2E8C);
+        }
+        #controlCard {
+            background: rgba(255,255,255,0.12);
+            border: 1px solid rgba(255,255,255,0.28);
+            border-radius: 14px;
+        }
+        #rightPanel { background: #EEF1FA; }
+        #loginCard, #activityCard {
+            background: #FFFFFF;
+            border: 1px solid #DCE4F2;
+            border-radius: 16px;
+        }
+
+        QLineEdit {
+            background: #F8FAFD; color: #10182D;
+            border: 1px solid #D5DBE7; border-radius: 8px;
+            padding: 0 12px; font-size: 13px; min-height: 42px;
+        }
+        QLineEdit:focus { border: 1.5px solid #2E6DEB; background: #FFFFFF; }
+
+        #loginBtn {
+            background: #1457E6; color: white; border: none;
+            border-radius: 8px; font-size: 13px; font-weight: 600;
+        }
+        #loginBtn:hover { background: #0E48C7; }
+        #loginBtn:disabled { background: #A8B7D8; }
+
+        #playBtn {
+            background: #16A34A; color: white; border: none;
+            border-radius: 10px; font-size: 14px; font-weight: 700;
+        }
+        #playBtn:hover { background: #12833C; }
+        #playBtn:disabled { background: rgba(255,255,255,0.28); color: #E5EDFF; }
+
+        #supportBtn {
+            background: transparent; color: white;
+            border: 1px solid rgba(255,255,255,0.55);
+            border-radius: 10px; font-size: 12px; font-weight: 600;
+        }
+        #supportBtn:hover { background: rgba(255,255,255,0.15); }
+
+        #eyeBtn { background: transparent; border: none; font-size: 14px; color: #71809E; }
+        #eyeBtn:hover { color: #1457E6; }
+
+        #clearBtn {
+            background: transparent; color: #71809E; border: none;
+            font-size: 11px; padding: 2px 6px;
+        }
+        #clearBtn:hover { color: #1457E6; }
+
+        #errorLabel {
+            color: #B91C1C; background: #FEF2F2;
+            border: 1px solid #FECACA; border-radius: 6px;
+            padding: 6px 10px; font-size: 11px;
+        }
+
+        QListWidget {
+            background: transparent; border: none; outline: none;
+            font-family: Consolas, "Segoe UI"; font-size: 11px;
+        }
+        QListWidget::item { padding: 3px 2px; }
+        QScrollBar:vertical { width: 8px; background: transparent; }
+        QScrollBar::handle:vertical { background: #CBD5E1; border-radius: 4px; min-height: 24px; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+    """
+
+    def __init__(
+        self,
+        master=None,
+        login_success=None,
+        automation_service=None,
+        support_callback=None,
+    ):
+        super().__init__(master)
+
+        self.login_success = login_success
+        self.automation_service = automation_service
+        self.support_callback = support_callback
+        self.login_thread = None
+        self.login_worker = None
+        self.support_tool = None
+
+        self.setStyleSheet(self.STYLE)
+        self.create_ui()
+
+        for message, level in LoginPage._history:
+            self._append_status(message, level)
+
+        if self.automation_service is not None:
+            self.automation_service.status.connect(self.add_status)
+            self.automation_service.running_changed.connect(self.update_play_button)
+            self.update_play_button(self.automation_service.is_running)
+        else:
+            self.update_play_button(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.username.text().strip():
+            self.password.setFocus()
+        else:
+            self.username.setFocus()
 
     # =========================================================
-    # LOGIN SUCCESS CALLBACK
+    # UI
     # =========================================================
 
-    def _emit_login_success(self, user):
+    def create_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_brand_panel(), 4)
+        root.addWidget(self._build_right_panel(), 6)
+
+    def _build_brand_panel(self):
+        panel = QFrame()
+        panel.setObjectName("brandPanel")
+        panel.setMinimumWidth(400)
+
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(42, 34, 42, 28)
+        lay.setSpacing(0)
+
+        # Company logo
+        logo_wrap = QFrame()
+        logo_wrap.setStyleSheet(
+            "QFrame { background:#FFFFFF; border:1px solid rgba(255,255,255,0.35); "
+            "border-radius:12px; }"
+        )
+        logo_lay = QHBoxLayout(logo_wrap)
+        logo_lay.setContentsMargins(12, 8, 12, 8)
+        logo_lay.addWidget(self._logo_label(185, 54))
+        lay.addWidget(logo_wrap, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addSpacing(24)
+
+        badge = QLabel("ASN AUTOMATION")
+        badge.setStyleSheet(
+            "color:#DCE6FF; font-size:11px; font-weight:700; letter-spacing:2px;"
+        )
+        lay.addWidget(badge)
+        lay.addSpacing(8)
+
+        title = QLabel("HSI Mahindra\nAuto ASN")
+        title.setStyleSheet("color:white; font-size:34px; font-weight:800;")
+        lay.addWidget(title)
+        lay.addSpacing(12)
+
+        tagline = QLabel(
+            "Automated Advance Shipping Notice preparation "
+            "and Mahindra Supplier Portal submission."
+        )
+        tagline.setWordWrap(True)
+        tagline.setStyleSheet("color:#DCE6FF; font-size:13px;")
+        lay.addWidget(tagline)
+
+        lay.addStretch(1)
+
+        # ---- process control card ----
+        card = QFrame()
+        card.setObjectName("controlCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(22, 20, 22, 22)
+        cl.setSpacing(0)
+
+        head = QHBoxLayout()
+        head_title = QLabel("ASN Process")
+        head_title.setStyleSheet("color:white; font-size:16px; font-weight:700;")
+        head.addWidget(head_title)
+        head.addStretch()
+        self.status_chip = QLabel()
+        head.addWidget(self.status_chip)
+        cl.addLayout(head)
+        cl.addSpacing(4)
+
+        hint = QLabel("Runs in the background. No login required.")
+        hint.setStyleSheet("color:#DCE6FF; font-size:11px;")
+        cl.addWidget(hint)
+        cl.addSpacing(16)
+
+        self.play_btn = QPushButton("\u25B6   Start ASN Process")
+        self.play_btn.setObjectName("playBtn")
+        self.play_btn.setFixedHeight(48)
+        self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play_btn.setToolTip("Start the ASN process without logging in")
+        self.play_btn.clicked.connect(self.play_process)
+        cl.addWidget(self.play_btn)
+        cl.addSpacing(10)
+
+        self.support_btn = QPushButton("\U0001F6E0   Support Tool  (restart if stuck)")
+        self.support_btn.setObjectName("supportBtn")
+        self.support_btn.setFixedHeight(40)
+        self.support_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.support_btn.clicked.connect(self.open_support_tool)
+        cl.addWidget(self.support_btn)
+
+        lay.addWidget(card)
+        lay.addSpacing(24)
+
+        footer = QLabel("\u00A9 2026 HSI Mahindra Auto ASN. All rights reserved.")
+        footer.setStyleSheet("color:#B7C8F5; font-size:10px;")
+        lay.addWidget(footer)
+        return panel
+
+    def _build_right_panel(self):
+        panel = QFrame()
+        panel.setObjectName("rightPanel")
+
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(42, 28, 42, 22)
+        lay.setSpacing(16)
+
+        # ---- login card, centred ----
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self._build_login_card())
+        row.addStretch(1)
+        lay.addStretch(1)
+        lay.addLayout(row)
+        lay.addStretch(1)
+
+        lay.addWidget(self._build_activity_card())
+        return panel
+
+    def _build_login_card(self):
+        card = QFrame()
+        card.setObjectName("loginCard")
+        card.setFixedWidth(410)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(34, 26, 34, 28)
+        lay.setSpacing(0)
+
+        logo = self._logo_label(155, 48)
+        logo.setStyleSheet(
+            "background:#F8FAFD; border:1px solid #E5EAF3; "
+            "border-radius:10px; padding:5px;"
+        )
+        lay.addWidget(logo, 0, Qt.AlignmentFlag.AlignCenter)
+        lay.addSpacing(16)
+
+        title = QLabel("Admin Login")
+        title.setStyleSheet("font-size:24px; font-weight:700;")
+        lay.addWidget(title)
+        lay.addSpacing(2)
+
+        sub = QLabel("Sign in with an Admin account to manage configuration.")
+        sub.setStyleSheet("color:#71809E; font-size:12px;")
+        lay.addWidget(sub)
+        lay.addSpacing(18)
+
+        lay.addWidget(self._field_label("Username"))
+        lay.addSpacing(5)
+        self.username = QLineEdit()
+        self.username.setPlaceholderText("Enter username")
+        lay.addWidget(self.username)
+        lay.addSpacing(12)
+
+        lay.addWidget(self._field_label("Password"))
+        lay.addSpacing(5)
+        self.password = QLineEdit()
+        self.password.setPlaceholderText("Enter password")
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setStyleSheet("QLineEdit { padding-right: 38px; }")
+
+        eye_layout = QHBoxLayout(self.password)
+        eye_layout.setContentsMargins(0, 0, 6, 0)
+        eye_layout.addStretch()
+        self.eye_btn = QPushButton("\U0001F441")
+        self.eye_btn.setObjectName("eyeBtn")
+        self.eye_btn.setFixedSize(28, 28)
+        self.eye_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.eye_btn.setToolTip("Show / hide password")
+        self.eye_btn.clicked.connect(self.toggle_password)
+        eye_layout.addWidget(self.eye_btn)
+        lay.addWidget(self.password)
+        lay.addSpacing(10)
+
+        self.error_label = QLabel()
+        self.error_label.setObjectName("errorLabel")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        lay.addWidget(self.error_label)
+        lay.addSpacing(8)
+
+        self.login_btn = QPushButton("Login")
+        self.login_btn.setObjectName("loginBtn")
+        self.login_btn.setFixedHeight(44)
+        self.login_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.login_btn.clicked.connect(self.login)
+        lay.addWidget(self.login_btn)
+
+        self.username.returnPressed.connect(self.password.setFocus)
+        self.password.returnPressed.connect(self.login)
+        self.username.textChanged.connect(self.clear_error)
+        self.password.textChanged.connect(self.clear_error)
+        return card
+
+    def _build_activity_card(self):
+        card = QFrame()
+        card.setObjectName("activityCard")
+        card.setFixedHeight(180)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(18, 12, 12, 10)
+        lay.setSpacing(4)
+
+        head = QHBoxLayout()
+        t = QLabel("Live Activity")
+        t.setStyleSheet("font-size:14px; font-weight:700;")
+        head.addWidget(t)
+        self.count_label = QLabel("0 events")
+        self.count_label.setStyleSheet("color:#94A3B8; font-size:11px;")
+        head.addWidget(self.count_label)
+        head.addStretch()
+        clear = QPushButton("Clear")
+        clear.setObjectName("clearBtn")
+        clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear.clicked.connect(self.clear_status)
+        head.addWidget(clear)
+        lay.addLayout(head)
+
+        self.status_list = QListWidget()
+        self.status_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self.status_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        lay.addWidget(self.status_list, 1)
+
+        self.empty_hint = "Waiting for activity \u2014 login, process and error events appear here."
+        self._show_empty_hint()
+        return card
+
+    @staticmethod
+    def _field_label(text):
+        label = QLabel(text)
+        label.setStyleSheet("font-size:12px; font-weight:600; color:#374151;")
+        return label
+
+    # =========================================================
+    # STATUS LOG
+    # =========================================================
+
+    def _show_empty_hint(self):
+        if self.status_list.count() == 0:
+            item = QListWidgetItem(self.empty_hint)
+            item.setForeground(QColor("#94A3B8"))
+            item.setData(Qt.ItemDataRole.UserRole, "hint")
+            self.status_list.addItem(item)
+
+    def _append_status(self, message, level):
+        if (
+            self.status_list.count() == 1
+            and self.status_list.item(0).data(Qt.ItemDataRole.UserRole) == "hint"
+        ):
+            self.status_list.clear()
+
+        icon, color = self.LEVELS.get(level, self.LEVELS["INFO"])
+        item = QListWidgetItem(f"{icon}  {message}")
+        item.setForeground(QColor(color))
+        self.status_list.addItem(item)
+
+        while self.status_list.count() > 500:
+            self.status_list.takeItem(0)
+
+        self.status_list.scrollToBottom()
+        self.count_label.setText(f"{self.status_list.count()} events")
+
+    def add_status(self, message, level="INFO"):
+        level = str(level).upper()
+        LoginPage._history.append((message, level))
+        del LoginPage._history[:-500]
+        self._append_status(message, level)
+
+    def clear_status(self):
+        LoginPage._history.clear()
+        self.status_list.clear()
+        self.count_label.setText("0 events")
+        self._show_empty_hint()
+
+    # =========================================================
+    # PROCESS CONTROL
+    # =========================================================
+
+    def update_play_button(self, running):
+        self.play_btn.setEnabled(not running)
+        self.play_btn.setText(
+            "\u23F3   Process Running\u2026" if running else "\u25B6   Start ASN Process"
+        )
+        if running:
+            self.status_chip.setText("\u25CF Running")
+            self.status_chip.setStyleSheet(
+                "background:rgba(34,197,94,0.30); color:#BBF7D0; "
+                "border-radius:10px; padding:3px 10px; font-size:11px; font-weight:700;"
+            )
+        else:
+            self.status_chip.setText("\u25CF Idle")
+            self.status_chip.setStyleSheet(
+                "background:rgba(255,255,255,0.18); color:#DCE6FF; "
+                "border-radius:10px; padding:3px 10px; font-size:11px; font-weight:700;"
+            )
+
+    def play_process(self):
+        if self.automation_service is None:
+            self.add_status("Automation service is unavailable.", "ERROR")
+            return
+
+        if self.automation_service.start("Login Page - Play"):
+            self.add_status("Play request accepted.", "SUCCESS")
+
+    def open_support_tool(self):
+        # Let the main window own the Support Tool when a callback is supplied.
+        # This avoids creating a second SupportTool instance from LoginPage.
+        if callable(self.support_callback):
+            self.support_callback()
+            return
+
+        # Backward-compatible fallback for running LoginPage by itself.
+        if self.automation_service is None:
+            return
+
+        if self.support_tool is None:
+            self.support_tool = SupportTool(
+                self.automation_service,
+                parent=self.window(),
+            )
+
+        self.support_tool.show()
+        self.support_tool.raise_()
+        self.support_tool.activateWindow()
+
+    # =========================================================
+    # LOGIN
+    # =========================================================
+
+    def toggle_password(self):
+        hidden = self.password.echoMode() == QLineEdit.EchoMode.Password
+        self.password.setEchoMode(
+            QLineEdit.EchoMode.Normal if hidden else QLineEdit.EchoMode.Password
+        )
+        self.eye_btn.setText("\U0001F576" if hidden else "\U0001F441")
+
+    def show_error(self, message):
+        self.error_label.setText(message)
+        self.error_label.show()
+
+    def clear_error(self, *_):
+        if self.error_label.isVisible():
+            self.error_label.hide()
+
+    def login(self):
+        if self.login_thread is not None:
+            return  # already signing in
+
+        username = self.username.text().strip()
+        password = self.password.text()
+
+        if not username:
+            self.show_error("Please enter your username.")
+            self.username.setFocus()
+            return
+
+        if not password:
+            self.show_error("Please enter your password.")
+            self.password.setFocus()
+            return
+
+        self.clear_error()
+        self.login_btn.setEnabled(False)
+        self.login_btn.setText("Signing in\u2026")
+        self.add_status("Validating credentials.", "INFO")
+
+        self.login_thread = QThread()
+        self.login_worker = LoginWorker(username, password)
+        self.login_worker.moveToThread(self.login_thread)
+
+        self.login_thread.started.connect(self.login_worker.run)
+        self.login_worker.success.connect(self.on_login_success)
+        self.login_worker.failed.connect(self.on_login_failed)
+        self.login_worker.finished.connect(self.login_thread.quit)
+        self.login_worker.finished.connect(self.login_worker.deleteLater)
+        self.login_thread.finished.connect(self.login_thread.deleteLater)
+        self.login_thread.finished.connect(self.on_login_thread_finished)
+
+        self.login_thread.start()
+
+    def on_login_success(self, user):
+        name = user.get("username", "Admin") if isinstance(user, dict) else "Admin"
+        self.add_status(f"User login successful - {name}.", "SUCCESS")
 
         if callable(self.login_success):
             self.login_success(user)
 
+    def on_login_failed(self, message):
+        self.add_status(message, "ERROR")
+        self.show_error(message)
+        self.password.selectAll()
+        self.password.setFocus()
 
-# =============================================================
-# OPTIONAL STANDALONE TEST
-# =============================================================
-#
-# Your existing main application can create the page like:
-#
-#     login_page = LoginPage(main_window, login_success)
-#     main_window.setCentralWidget(login_page)
-#
-# If you want to test only this file, run it directly.
-# =============================================================
-
-if __name__ == "__main__":
-
-    import sys
-
-    app = QApplication(sys.argv)
-
-    app.setStyle("Fusion")
-
-    window = QWidget()
-    window.setWindowTitle("Login")
-    window.resize(1366, 768)
-
-    def login_success(user):
-        print("LOGIN SUCCESS")
-        print("User:", user.Username)
-        print("Role:", user.Role)
-        print("Department:", user.DepartmentName)
-
-    login_page = LoginPage(
-        window,
-        login_success=login_success,
-    )
-
-    layout = QVBoxLayout(window)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.addWidget(login_page)
-
-    window.show()
-
-    sys.exit(app.exec())
+    def on_login_thread_finished(self):
+        self.login_thread = None
+        self.login_worker = None
+        self.login_btn.setEnabled(True)
+        self.login_btn.setText("Login")

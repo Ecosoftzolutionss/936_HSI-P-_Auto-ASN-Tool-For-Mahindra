@@ -232,7 +232,7 @@ class UserMasterPage(QWidget):
                     )
                 )
         else:
-            self.logo_label.setText("HSI\nAUTOMATION PORTAL")
+            self.logo_label.setText("HSI\nMAHINDRA AUTO ASN")
             self.logo_label.setStyleSheet("""
                 QLabel {
                     color: #10182D;
@@ -464,7 +464,7 @@ class UserMasterPage(QWidget):
         # =====================================================
 
         self.footer = QLabel(
-            "© 2025 HSI Automation Portal. All rights reserved."
+            "© 2025 HSI Mahindra Auto ASN. All rights reserved."
         )
         self.footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.footer.setFixedHeight(25)
@@ -899,7 +899,7 @@ class UserMasterPage(QWidget):
             header_item = self.table_widget.horizontalHeaderItem(col)
             if header_item is not None:
                 header_item.setTextAlignment(
-                    Qt.AlignmentFlag.AlignCenter | Qt.AlignVCenter
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
                 )
 
         self.table_widget.clearSelection()
@@ -1481,7 +1481,7 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
 
     window = QMainWindow()
-    window.setWindowTitle("HSI Automation Portal - User Master")
+    window.setWindowTitle("HSI Mahindra Auto ASN - User Master")
     window.resize(1347, 758)
     window.setMinimumSize(1100, 620)
 

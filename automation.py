@@ -2,16 +2,18 @@
 # CORRECTED MAHINDRA AUTOMATION
 # ============================================================
 # After ASN creation:
-#   1. Skip ASN Barcode PDF download.
-#   2. Open Doc Upload.
+#   1. Validate each ASN result row independently.
+#   2. Attempt ASN Barcode PDF download (failure is logged but does not
+#      block the invoice-by-invoice Doc Upload flow).
+#   3. Open Doc Upload.
 #   3. Click Search.
-#   4. From Date = today - 2 days.
+#   4. From Date = today.
 #   5. To Date = today.
 #   6. Select Material using UI5 container //*[@id="RB1-12"].
 #   7. Submit using //*[@id="__button3-content"].
 #   8. Click Pending Invoice using //*[@id="__button1"].
 #   9. Click Pending row using //*[@id="__item2-__xmlview0--list1-0"].
-#  10. Click Upload Invoice directly using idBtnIA-content / idBtnIA-BDI-content.
+#  12. Click Upload Invoice directly using idBtnIA-content / idBtnIA-BDI-content.
 #      IMPORTANT: Attachment panel is already open; do NOT click Attachment again.
 # ============================================================
 
@@ -52,6 +54,8 @@ import threading
 import os
 import shutil
 from pathlib import Path
+
+import pandas as pd
 
 import pyodbc
 
@@ -280,6 +284,8 @@ class AutomationController:
         self._stop_event = threading.Event()
         self._running = False
         self._winsec_watcher_active = False
+        self.last_invoice_failure_reason = None
+        self._attachment_panel_open = False
 
         self.otp_started = False
         self.otp_verify_clicked = False
@@ -458,9 +464,10 @@ class AutomationController:
         # -------------------------------------------------------------
         # DOWNLOAD DIRECTORY
         # -------------------------------------------------------------
-        # ASN Barcode PDF download is intentionally skipped in the current
-        # workflow. Therefore Edge startup must NOT depend on
-        # ASN_BARCODE_PATH.
+        # ASN Barcode PDF is a best-effort step after ASN row validation.
+        # Edge startup may therefore proceed even if the barcode destination
+        # is not configured; the failure is reported in the user log and the
+        # invoice-by-invoice Doc Upload flow continues.
         #
         # F_PATH is already the configured HSI automation folder, so use it
         # as the general Edge download directory.
@@ -1653,6 +1660,9 @@ class AutomationController:
                 print("=" * 70)
                 print("ERROR: MAHINDRA OTP EMAIL NOT FOUND")
                 print("=" * 70)
+                # Keep this as a hard failure. The application must not appear
+                # to be running normally when the OTP could not be obtained.
+                self._stop_event.set()
                 return
 
             self.otp_value = str(otp).strip()
@@ -3327,296 +3337,503 @@ class AutomationController:
     # ASN QUEUE - PROCESS ONE UPLOAD ASN PAGE
     # ------------------------------------------------------------------------
 
-    def _process_current_asn_upload_page(
-        self,
-        timeout=60,
-    ):
-        """
-        Process exactly ONE file from F_PATH/Pending.
+    def _load_expected_asn_rows(self, file_path):
+        """Read the exact rows that were uploaded to Mahindra."""
+        if not file_path or not os.path.isfile(file_path):
+            return []
+        try:
+            ext = Path(file_path).suffix.lower()
+            if ext == ".csv":
+                df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
+            else:
+                df = pd.read_excel(file_path, dtype=str).fillna("")
+            df.columns = [str(c).strip() for c in df.columns]
+            required = ["PO/SA Number", "Item Sr No", "Part No", "ASN Quantity", "Invoice No"]
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                print("ASN validation: required columns missing:", missing)
+                return []
+            rows = []
+            for _, row in df.iterrows():
+                rows.append({c: str(row.get(c, "") or "").strip() for c in required})
+            return rows
+        except Exception as error:
+            print("ASN validation: could not read uploaded file:", repr(error))
+            return []
 
-        Flow:
-            Pending oldest file
-                -> Upload ASN
-                -> ASN creation / already-created confirmation
-                -> capture invoice numbers
-                -> AUTO_STATUS = 1
-                -> Doc Upload search
-                -> move CSV to Completed
+    @staticmethod
+    def _norm_asn_value(value):
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        try:
+            number = float(value.replace(",", ""))
+            if number.is_integer():
+                return str(int(number))
+            return f"{number:.10f}".rstrip("0").rstrip(".")
+        except Exception:
+            return re.sub(r"\s+", "", value).upper()
 
-        If any required step fails, the file remains in Pending.
-        """
-
+    def _read_asn_result_rows(self):
+        """Extract Invoice/PO/Item/Part/Quantity/Error from Mahindra result grid."""
         if self.driver is None:
+            return []
+        script = r"""
+        (() => {
+          const clean = v => (v || '').replace(/\s+/g, ' ').trim();
+          const canon = v => clean(v).toLowerCase().replace(/[^a-z0-9]/g, '');
+          const aliases = {
+            invoice: ['invoiceno','invoicenumber','invoice'],
+            order: ['orderno','po','posanumber','posanumber','purchaseorderno'],
+            item: ['itemno','itemsrno','item'],
+            part: ['partno','partnumber','part'],
+            qty: ['quantity','asnquantity','qty'],
+            error: ['errorifany','error','message','errormessage']
+          };
+          const findIndex = (headers, names) => headers.findIndex(h => names.includes(canon(h)));
+          const out = [];
+          for (const table of document.querySelectorAll('table')) {
+            const rows = [...table.querySelectorAll('tr')];
+            if (!rows.length) continue;
+            let headerIndex = -1, idx = null;
+            for (let r=0; r<rows.length; r++) {
+              const cells = [...rows[r].querySelectorAll('th,td')].map(c => clean(c.innerText || c.textContent));
+              if (!cells.length) continue;
+              const headers = {
+                invoice: findIndex(cells, aliases.invoice), order: findIndex(cells, aliases.order),
+                item: findIndex(cells, aliases.item), part: findIndex(cells, aliases.part),
+                qty: findIndex(cells, aliases.qty), error: findIndex(cells, aliases.error)
+              };
+              if (headers.invoice >= 0 && (headers.error >= 0 || headers.part >= 0 || headers.qty >= 0)) {
+                headerIndex = r; idx = headers; break;
+              }
+            }
+            if (headerIndex < 0) continue;
+            for (let r=headerIndex+1; r<rows.length; r++) {
+              const cells = [...rows[r].querySelectorAll('td,th')].map(c => clean(c.innerText || c.textContent));
+              if (!cells.length || idx.invoice >= cells.length) continue;
+              const invoice = cells[idx.invoice] || '';
+              if (!invoice || !/^[A-Za-z0-9/_-]{3,50}$/.test(invoice)) continue;
+              const get = k => idx[k] >= 0 && idx[k] < cells.length ? cells[idx[k]] : '';
+              out.push({invoice_no: invoice, order_no:get('order'), item_no:get('item'), part_no:get('part'), quantity:get('qty'), error:get('error')});
+            }
+          }
+          return out;
+        })();
+        """
+        try:
+            self.driver.switch_to.default_content()
+            rows = self.driver.execute_script(script) or []
+            if rows:
+                return rows
+        except Exception as error:
+            print("ASN result grid extraction warning:", repr(error))
+        # Fallback: invoice numbers from page text, with no row-level error data.
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text or ""
+            return [{"invoice_no": x, "order_no":"", "item_no":"", "part_no":"", "quantity":"", "error":""}
+                    for x in dict.fromkeys(re.findall(r"\bP\d{6,20}\b", body, re.I))]
+        except Exception:
+            return []
+
+    def _validate_asn_result_rows(self, expected_rows):
+        """Return (successful_rows, failed_rows, response_rows). Any Error cell is a failure."""
+        response_rows = self._read_asn_result_rows()
+        response_by_invoice = {str(r.get('invoice_no','')).strip().upper(): r for r in response_rows}
+        successful, failed = [], []
+        for expected in expected_rows:
+            invoice = expected.get("Invoice No", "").strip()
+            key = invoice.upper()
+            actual = response_by_invoice.get(key)
+            if not actual:
+                failed.append({"invoice_no": invoice, "reason": "Mahindra did not return a result row for this invoice."})
+                continue
+            error_text = str(actual.get("error") or "").strip()
+            reasons = []
+            if error_text:
+                reasons.append(error_text)
+            checks = (("PO/SA Number", "order_no"), ("Item Sr No", "item_no"), ("Part No", "part_no"), ("ASN Quantity", "quantity"))
+            for expected_key, actual_key in checks:
+                expected_value = expected.get(expected_key, "")
+                actual_value = actual.get(actual_key, "")
+                if expected_value and actual_value and self._norm_asn_value(expected_value) != self._norm_asn_value(actual_value):
+                    reasons.append(f"{expected_key}: uploaded '{expected_value}' but Mahindra returned '{actual_value}'")
+            if reasons:
+                failed.append({"invoice_no": invoice, "reason": " | ".join(dict.fromkeys(reasons))})
+            else:
+                successful.append(expected)
+        # Never treat an unexplained global failure as success.
+        if not response_rows:
+            return [], [{"invoice_no": r.get("Invoice No", ""), "reason": "Mahindra ASN result could not be read."} for r in expected_rows], response_rows
+        return successful, failed, response_rows
+
+    def _retain_only_failed_asn_rows(self, file_path, failed_invoice_numbers):
+        """After partial success, retain only failed rows in Pending for retry."""
+        failed = {str(x).strip().upper() for x in failed_invoice_numbers if str(x).strip()}
+        if not failed or not file_path or not os.path.isfile(file_path):
+            return False
+        try:
+            ext = Path(file_path).suffix.lower()
+            if ext == ".csv":
+                df = pd.read_csv(file_path, dtype=str, keep_default_na=False)
+            else:
+                df = pd.read_excel(file_path, dtype=str).fillna("")
+            invoice_col = next((c for c in df.columns if str(c).strip().lower() == "invoice no"), None)
+            if not invoice_col:
+                return False
+            mask = df[invoice_col].astype(str).str.strip().str.upper().isin(failed)
+            remaining = df.loc[mask].copy()
+            if ext == ".csv":
+                remaining.to_csv(file_path, index=False, encoding="utf-8-sig")
+            else:
+                remaining.to_excel(file_path, index=False)
+            print("Pending ASN file reduced to failed invoice rows:", len(remaining))
+            return True
+        except Exception as error:
+            print("Could not retain failed ASN rows:", repr(error))
+            return False
+
+    def _mark_current_asn_file_failed(self, failed_invoice_numbers=None, reason=""):
+        """Move the current ASN queue file to Failed so the next file can continue."""
+        file_path = self.current_asn_file_path
+        if not file_path:
+            return False
+
+        failed_invoice_numbers = [
+            str(v).strip()
+            for v in (failed_invoice_numbers or [])
+            if str(v).strip()
+        ]
+
+        # If only specific invoices failed, keep only those rows in the retry file.
+        if failed_invoice_numbers:
+            try:
+                self._retain_only_failed_asn_rows(
+                    file_path,
+                    failed_invoice_numbers,
+                )
+            except Exception as error:
+                print(
+                    "Could not reduce failed ASN file to failed invoice rows:",
+                    repr(error),
+                )
+
+        f_path = self._get_asn_file_path_from_db()
+        failed_dir = os.path.join(f_path, "Failed") if f_path else ""
+
+        try:
+            if failed_dir and os.path.isfile(file_path):
+                os.makedirs(failed_dir, exist_ok=True)
+                destination = os.path.join(
+                    failed_dir,
+                    os.path.basename(file_path),
+                )
+
+                if os.path.abspath(destination) != os.path.abspath(file_path):
+                    if os.path.exists(destination):
+                        os.remove(destination)
+                    shutil.move(file_path, destination)
+
+                print("ASN FILE MOVED TO FAILED:", destination)
+
+            if reason:
+                print("FAILED ASN FILE REASON:", reason)
+
+            self.current_asn_file_path = None
+            return True
+
+        except Exception as error:
             print(
-                "ASN queue: Edge driver is unavailable."
+                "Could not move failed ASN file to Failed folder:",
+                repr(error),
             )
             return False
 
-        # -------------------------------------------------------------
-        # VERIFY CURRENT UPLOAD ASN PAGE
-        # -------------------------------------------------------------
+    def _process_current_asn_upload_page(self, timeout=60):
+        """
+        Process exactly one Pending ASN file.
 
-        print("Verifying Upload ASN page...")
+        Important negative-scenario behaviour:
+          * Every Mahindra ASN result row is checked independently.
+          * Failed rows are logged with their exact reason.
+          * Successful rows continue to Barcode/Doc Upload.
+          * Barcode download failure is logged but does NOT block Doc Upload.
+          * Doc Upload is processed invoice-by-invoice.
+          * Missing ORIGINAL invoice PDF does NOT stop the next invoice.
+          * Only invoices whose Doc Upload succeeds can receive Auto_Status=1.
+          * A partially failed file is moved to Failed and the next Pending file
+            continues automatically.
+        """
+        if self.driver is None:
+            print("ASN queue: Edge driver is unavailable.")
+            return False
 
-        verification_end = (
-            time.time() + 20
-        )
-
+        # Verify Upload ASN page.
+        end = time.time() + 20
         verified = False
 
-        while time.time() < verification_end:
-
+        while time.time() < end:
             try:
-                current_url = (
-                    self.driver.current_url
-                    or ""
-                )
-
-                title = (
-                    self.driver.title
-                    or ""
-                )
-
-                body_text = ""
-
-                try:
-                    body_text = (
-                        self.driver.find_element(
-                            By.TAG_NAME,
-                            "body",
-                        ).text
-                        or ""
-                    ).lower()
-
-                except Exception:
-                    pass
-
-                print(
-                    "Upload ASN verification:",
-                    current_url,
-                    "| title:",
-                    title,
-                )
+                url = (self.driver.current_url or "").lower()
+                body = (
+                    self.driver.find_element(
+                        By.TAG_NAME,
+                        "body",
+                    ).text or ""
+                ).lower()
 
                 if (
-                    "zasnupload" in current_url.lower()
-                    or "upload.htm" in current_url.lower()
-                    or "upload asn" in body_text
-                    or "uploadasn" in current_url.lower()
+                    "zasnupload" in url
+                    or "upload.htm" in url
+                    or "upload asn" in body
+                    or "uploadasn" in url
                 ):
                     verified = True
                     break
 
-            except Exception as error:
-                print(
-                    "Upload ASN verification warning:",
-                    repr(error),
-                )
+            except Exception:
+                pass
 
             time.sleep(0.5)
 
         if not verified:
-            print(
-                "Upload ASN page could not be verified."
-            )
+            print("Upload ASN page could not be verified.")
             return False
 
-        print("=" * 70)
-        print("UPLOAD ASN PAGE VERIFIED")
-        print("Current URL:", self.driver.current_url)
-        print("Current title:", self.driver.title)
-        print("=" * 70)
-
-        # -------------------------------------------------------------
-        # SELECT OLDEST PENDING FILE
-        # -------------------------------------------------------------
-
-        if not self._select_asn_file_from_db(
-            timeout=30
-        ):
-            print("=" * 70)
+        # Select the oldest Pending ASN file.
+        if not self._select_asn_file_from_db(timeout=30):
             print("ASN FILE SELECTION FAILED")
-            print("No Pending ASN file was selected.")
-            print("=" * 70)
-            return False
+            print(
+                "The current file cannot be processed safely. "
+                "It will be moved to Failed and the queue will continue."
+            )
+            self._mark_current_asn_file_failed(
+                reason="ASN file could not be selected from Pending."
+            )
+            return True
 
-        # -------------------------------------------------------------
-        # CLICK UPLOAD
-        # -------------------------------------------------------------
+        expected_rows = self._load_expected_asn_rows(
+            self.current_asn_file_path
+        )
 
-        if not self._click_asn_upload_button(
-            timeout=30
-        ):
-            print("=" * 70)
+        if not expected_rows:
+            print(
+                "ASN VALIDATION FAILED: uploaded file rows could not be read."
+            )
+            self._mark_current_asn_file_failed(
+                reason="ASN file contains no readable business rows."
+            )
+            return True
+
+        if not self._click_asn_upload_button(timeout=30):
             print("ASN UPLOAD BUTTON CLICK FAILED")
-            print("The selected file remains in Pending.")
-            print("=" * 70)
-            return False
+            self._mark_current_asn_file_failed(
+                reason="Mahindra Upload ASN button could not be clicked."
+            )
+            return True
 
-        print("=" * 70)
-        print("ASN FILE SELECTED AND UPLOAD BUTTON CLICKED")
         print(
-            "FILE:",
+            "ASN FILE SELECTED AND UPLOAD BUTTON CLICKED:",
             self.current_asn_file_path,
         )
-        print("=" * 70)
+
+        if not self._wait_for_asn_creation(timeout=timeout):
+            print("ASN creation could not be confirmed.")
+            self._mark_current_asn_file_failed(
+                reason="Mahindra ASN creation could not be confirmed."
+            )
+            return True
 
         # -------------------------------------------------------------
-        # WAIT FOR ASN CREATION
+        # ROW-LEVEL ASN VALIDATION
         # -------------------------------------------------------------
-
-        if not self._wait_for_asn_creation(
-            timeout=timeout
-        ):
-            print(
-                "ASN creation could not be confirmed."
-            )
-            print(
-                "Pending file will NOT be moved."
-            )
-            return False
-
-        # -------------------------------------------------------------
-        # GET INVOICE NUMBERS
-        # -------------------------------------------------------------
-
-        invoice_numbers = list(
-            dict.fromkeys(
-                self.created_asn_invoice_numbers
-                or []
-            )
-        )
-
-        if not invoice_numbers:
-
-            try:
-                body_text = (
-                    self.driver.find_element(
-                        By.TAG_NAME,
-                        "body",
-                    ).text
-                    or ""
-                )
-
-                invoice_numbers = list(
-                    dict.fromkeys(
-                        re.findall(
-                            r"\bP\d{6,20}\b",
-                            body_text,
-                            flags=re.IGNORECASE,
-                        )
-                    )
-                )
-
-            except Exception as error:
-                print(
-                    "Invoice body-text fallback warning:",
-                    repr(error),
-                )
-
-        if not invoice_numbers:
-            print("=" * 70)
-            print(
-                "ASN WAS CONFIRMED BUT NO INVOICE NUMBER "
-                "COULD BE IDENTIFIED."
-            )
-            print(
-                "AUTO_STATUS cannot be safely updated."
-            )
-            print(
-                "Pending file will remain in Pending."
-            )
-            print("=" * 70)
-            return False
-
-        self.created_asn_invoice_numbers = list(
-            dict.fromkeys(
-                invoice_numbers
-            )
+        successful_rows, failed_rows, response_rows = (
+            self._validate_asn_result_rows(expected_rows)
         )
 
         print(
-            "Created ASN invoice numbers:",
+            f"ASN VALIDATION RESULT: total={len(expected_rows)} "
+            f"success={len(successful_rows)} failed={len(failed_rows)}"
+        )
+
+        failed_asn_invoices = []
+
+        for row in failed_rows:
+            invoice_no = str(row.get("invoice_no") or "").strip()
+            reason_text = str(
+                row.get("reason")
+                or "Mahindra returned an ASN validation failure."
+            ).strip()
+
+            failed_asn_invoices.append(invoice_no)
+
+            print(
+                f"INVOICE FAILED: {invoice_no} | REASON: {reason_text}"
+            )
+
+        if failed_rows:
+            print(
+                "ASN row validation found failures. "
+                "Successful rows will continue independently."
+            )
+
+        # If every ASN row failed, this file is failed but the NEXT file
+        # must still be processed.
+        if not successful_rows:
+            print(
+                "ALL ASN ROWS FAILED. "
+                "No Barcode/Doc Upload will run for this file."
+            )
+
+            if not self._mark_current_asn_file_failed(
+                failed_asn_invoices,
+                reason="All ASN rows failed Mahindra validation.",
+            ):
+                return False
+
+            print(
+                "QUEUE CONTINUING AFTER FAILED ASN FILE: "
+                "all rows failed, moving to the next Pending file."
+            )
+            return True
+
+        successful_invoices = list(
+            dict.fromkeys(
+                str(row.get("Invoice No") or "").strip()
+                for row in successful_rows
+                if str(row.get("Invoice No") or "").strip()
+            )
+        )
+
+        self.created_asn_invoice_numbers = list(successful_invoices)
+
+        print(
+            "Successful ASN invoices:",
             self.created_asn_invoice_numbers,
         )
 
         # -------------------------------------------------------------
-        # UPDATE AUTO_STATUS
+        # BARCODE = BEST EFFORT
         # -------------------------------------------------------------
+        # A Barcode PDF problem must be visible to the user, but it must NOT
+        # stop successful invoices from reaching the one-by-one Doc Upload flow.
+        barcode_ok = self._download_asn_barcode(timeout=60)
 
-        status_updated = (
-            self._update_invoice_auto_status(
-                self.created_asn_invoice_numbers,
-                auto_status=1,
+        if not barcode_ok:
+            print(
+                "ASN BARCODE DOWNLOAD FAILED | "
+                "REASON: Barcode PDF could not be downloaded. "
+                "Continuing with invoice-by-invoice Doc Upload."
+            )
+        else:
+            print(
+                "ASN BARCODE DOWNLOAD COMPLETED:",
+                self.asn_barcode_download_dir,
+            )
+
+        # -------------------------------------------------------------
+        # DOC UPLOAD = ONE INVOICE AT A TIME
+        # -------------------------------------------------------------
+        doc_result = self._open_doc_upload_and_search(
+            successful_invoices,
+            timeout=60,
+        )
+
+        if isinstance(doc_result, dict):
+            doc_ok = bool(doc_result.get("ok"))
+            doc_completed = list(doc_result.get("completed") or [])
+            doc_failed = dict(doc_result.get("failed") or {})
+        else:
+            # Backward-compatible handling for older implementations.
+            doc_ok = bool(doc_result)
+            doc_completed = successful_invoices[:] if doc_ok else []
+            doc_failed = (
+                {}
+                if doc_ok
+                else {
+                    invoice: "Doc Upload flow failed before this invoice "
+                    "could be completed."
+                    for invoice in successful_invoices
+                }
+            )
+
+        for invoice_no, reason_text in doc_failed.items():
+            print(
+                f"INVOICE FAILED: {invoice_no} | "
+                f"REASON: {reason_text}"
+            )
+
+        # Combine ASN-row failures and Doc Upload failures.
+        all_failed_invoices = list(
+            dict.fromkeys(
+                failed_asn_invoices
+                + list(doc_failed.keys())
             )
         )
 
-        if not status_updated:
-            print("=" * 70)
-            print(
-                "AUTO_STATUS UPDATE FAILED"
-            )
-            print(
-                "Pending file will remain in Pending."
-            )
-            print("=" * 70)
-            return False
+        # If the Doc Upload page itself failed before we could determine
+        # invoice-level results, keep every successful ASN invoice retryable.
+        if not doc_ok and not doc_failed:
+            for invoice_no in successful_invoices:
+                if invoice_no not in doc_completed:
+                    doc_failed[invoice_no] = (
+                        "Doc Upload flow failed before invoice completion."
+                    )
 
-        # -------------------------------------------------------------
-        # DOC UPLOAD
-        # -------------------------------------------------------------
-
-        print("=" * 70)
-        print("ASN CREATED + AUTO_STATUS UPDATED")
-        print("Continuing to DOC UPLOAD...")
-        print("=" * 70)
-
-        if not self._open_doc_upload_and_search(
-            timeout=40
-        ):
-            print("=" * 70)
-            print("DOC UPLOAD SEARCH FLOW FAILED")
-            print(
-                "AUTO_STATUS is already 1."
+            all_failed_invoices = list(
+                dict.fromkeys(
+                    failed_asn_invoices
+                    + list(doc_failed.keys())
+                )
             )
+
+        if all_failed_invoices:
+            print("=" * 70)
+            print("PARTIAL ASN SUCCESS")
+            print("Completed invoices:", doc_completed)
+            print("Failed invoices:", all_failed_invoices)
             print(
-                "Pending file is NOT moved because the complete "
-                "workflow did not finish."
+                "Failed rows will remain retryable in the Failed folder. "
+                "Completed invoices are not retried."
             )
             print("=" * 70)
-            return False
 
-        # -------------------------------------------------------------
-        # MOVE FILE ONLY AFTER COMPLETE SUCCESS
-        # -------------------------------------------------------------
+            if not self._mark_current_asn_file_failed(
+                all_failed_invoices,
+                reason="One or more ASN/Doc Upload rows failed.",
+            ):
+                return False
 
+            print(
+                "QUEUE CONTINUING AFTER PARTIAL FAILURE: "
+                "processing the next Pending ASN file."
+            )
+            return True
+
+        # No row-level failures remain.
         f_path = self._get_asn_file_path_from_db()
 
         if not f_path:
-            print(
-                "F_PATH could not be loaded after ASN completion."
-            )
+            print("F_PATH is no longer available.")
             return False
 
         if not self._move_completed_asn_file(
             self.current_asn_file_path,
             f_path,
         ):
-            print(
-                "WARNING: ASN workflow completed, but the CSV "
-                "could not be moved to Completed."
-            )
             return False
 
-        # Reset current file after it has been moved.
         self.current_asn_file_path = None
 
-        print("=" * 70)
-        print("ONE ASN QUEUE ITEM COMPLETED")
-        print("=" * 70)
+        if barcode_ok:
+            print("ONE ASN QUEUE ITEM COMPLETED SUCCESSFULLY")
+        else:
+            print(
+                "ONE ASN QUEUE ITEM COMPLETED WITH BARCODE WARNING. "
+                "Invoice Doc Upload and Auto_Status processing completed."
+            )
 
         return True
-
 
     # ------------------------------------------------------------------------
     # ASN CREATION - WAIT FOR SUCCESS
@@ -4780,11 +4997,11 @@ class AutomationController:
         print("Mahindra Self Service tab containing Doc Upload was not found.")
         return False
 
-    def _open_doc_upload_and_search(self, timeout=40):
+    def _open_doc_upload_and_search(self, target_invoices=None, timeout=40):
         """
         Complete the requested post-ASN flow:
 
-            ASN Barcode skipped
+            ASN Barcode (best effort)
                 -> Self Service tab
                 -> Doc Upload (start_InvUpl)
                 -> NEW Edge tab
@@ -5087,7 +5304,7 @@ class AutomationController:
         # STEP 12F: FROM DATE = TODAY - 2 DAYS
         # -------------------------------------------------------------
         today = datetime.now().date()
-        from_date = today - timedelta(days=2)
+        from_date = today
 
         print(
             "STEP 14: Selecting From Date:",
@@ -5495,17 +5712,36 @@ class AutomationController:
         #
         # Re-find both controls because SAP UI5 can re-render the toolbar
         # after Submit / Pending Invoice.
-        if not self._process_all_pending_invoices(timeout=40):
+        doc_result = self._process_all_pending_invoices(
+            timeout=40,
+            target_invoices=target_invoices,
+        )
+
+        if not isinstance(doc_result, dict):
+            doc_result = {
+                "ok": bool(doc_result),
+                "completed": [],
+                "failed": {},
+            }
+
+        # A per-invoice failure is intentionally NOT treated as a page-level
+        # failure. _process_all_pending_invoices continues with the next
+        # invoice and returns the complete summary.
+        if not doc_result.get("ok"):
             print("=" * 70)
             print("PENDING INVOICE / ATTACHMENT FLOW FAILED")
+            print("Completed:", doc_result.get("completed", []))
+            print("Failed:", doc_result.get("failed", {}))
             print("=" * 70)
-            return False
+            return doc_result
 
         # Give SAP/UI5 time to finish opening the attachment/details area.
         time.sleep(1)
 
         print("=" * 70)
         print("DOC UPLOAD SEARCH SUBMITTED SUCCESSFULLY")
+        print("Completed invoices:", doc_result.get("completed", []))
+        print("Failed invoices:", doc_result.get("failed", {}))
         print(
             "Date range:",
             from_date.strftime("%d-%m-%Y"),
@@ -5515,7 +5751,7 @@ class AutomationController:
         print("Type: Material")
         print("=" * 70)
 
-        return True
+        return doc_result
 
     def _get_ds_invoice_path_from_db(self):
         """Read DS_INVOICE_PATH dynamically from dbo.SETTINGS."""
@@ -5986,7 +6222,12 @@ class AutomationController:
         invoice_no = str(pending_item.get("invoice_no") or "").strip()
         asn_no = str(pending_item.get("asn_no") or "").strip()
 
+        self.last_invoice_failure_reason = None
+
         if not invoice_no:
+            self.last_invoice_failure_reason = (
+                "Invoice No could not be extracted from the Pending row."
+            )
             print(
                 "ERROR: Invoice No could not be extracted from Pending row:",
                 pending_item.get("row_text", ""),
@@ -6058,6 +6299,7 @@ class AutomationController:
                     return False
 
                 print("FIRST ASN: Attachment panel opened.")
+                self._attachment_panel_open = True
                 time.sleep(0.8)
 
             except Exception as error:
@@ -6091,10 +6333,16 @@ class AutomationController:
                 upload_button = None
 
         if upload_button is None:
+            self.last_invoice_failure_reason = (
+                "Upload Invoice button was not found on the Mahindra page."
+            )
             print("Upload Invoice button was not found.")
             return False
 
         if not self._click_element_safe(upload_button):
+            self.last_invoice_failure_reason = (
+                "Upload Invoice button could not be clicked."
+            )
             return False
 
         print("Upload Invoice clicked.")
@@ -6109,6 +6357,9 @@ class AutomationController:
             )
             print("File Attachment modal opened: __dialog3")
         except Exception as error:
+            self.last_invoice_failure_reason = (
+                "File Attachment modal was not found after clicking Upload Invoice."
+            )
             print("File Attachment modal was not found:", repr(error))
             return False
 
@@ -6117,6 +6368,9 @@ class AutomationController:
         # -------------------------------------------------------------
         ds_invoice_path = self._get_ds_invoice_path_from_db()
         if not ds_invoice_path:
+            self.last_invoice_failure_reason = (
+                "DS_INVOICE_PATH is missing or not configured."
+            )
             print("Cannot upload invoice: DS_INVOICE_PATH is missing.")
             return False
 
@@ -6125,6 +6379,10 @@ class AutomationController:
             ds_invoice_path,
         )
         if not invoice_file:
+            self.last_invoice_failure_reason = (
+                f"ORIGINAL invoice PDF not found for {invoice_no}. "
+                f"Expected {invoice_no}ORIGINALINVOICE.pdf in DS_INVOICE_PATH."
+            )
             print(
                 f"Cannot upload Invoice {invoice_no}: ORIGINAL invoice PDF not found."
             )
@@ -6170,6 +6428,10 @@ class AutomationController:
                     file_input = file_container
 
             if file_input is None:
+                self.last_invoice_failure_reason = (
+                    "Invoice file input was not found inside Mahindra "
+                    "attachment control __hbox0."
+                )
                 print(
                     "File input not found inside __hbox0. "
                     "Container XPath:",
@@ -6190,6 +6452,9 @@ class AutomationController:
                 pass
 
         except Exception as error:
+            self.last_invoice_failure_reason = (
+                f"Invoice PDF selection failed for {invoice_no}: {error}"
+            )
             print("Invoice file selection failed:", repr(error))
             return False
 
@@ -6968,94 +7233,197 @@ class AutomationController:
         print("Success popup acknowledged.")
         print("ASN No     :", asn_no)
         print("Invoice No :", invoice_no)
+
+        # AUTO_STATUS is invoice-based and is updated ONLY after the
+        # Mahindra Doc Upload success popup has been acknowledged.
+        if not self._update_invoice_auto_status([invoice_no], auto_status=1):
+            self.last_invoice_failure_reason = (
+                f"Auto_Status=1 update/verification failed for Invoice {invoice_no}."
+            )
+            print(f"AUTO_STATUS UPDATE FAILED for Invoice {invoice_no}")
+            return False
+        print(f"AUTO_STATUS=1 VERIFIED for Invoice {invoice_no}")
         print("Starting next Pending ASN...")
         print("=" * 70)
 
         return True
 
-    def _process_all_pending_invoices(self, timeout=40):
+    def _close_invoice_attachment_modal(self):
+        """Best-effort close for a failed invoice attachment dialog."""
+        if self.driver is None:
+            return
+
+        dialog_xpath = '//*[@id="__dialog3"]'
+
+        try:
+            dialog = self.driver.find_element(By.XPATH, dialog_xpath)
+        except Exception:
+            dialog = None
+
+        # Prefer a visible Cancel/Close button inside the attachment dialog.
+        if dialog is not None:
+            try:
+                buttons = dialog.find_elements(
+                    By.XPATH,
+                    ".//button | //*[@role='button'] | "
+                    ".//input[@type='button'] | .//input[@type='submit']",
+                )
+
+                for button in buttons:
+                    try:
+                        if not button.is_displayed():
+                            continue
+
+                        label = (
+                            button.text
+                            or button.get_attribute("value")
+                            or button.get_attribute("aria-label")
+                            or button.get_attribute("title")
+                            or ""
+                        ).strip().lower()
+
+                        if label in {
+                            "cancel",
+                            "close",
+                            "back",
+                            "x",
+                        } or "cancel" in label or "close" in label:
+                            if self._click_element_safe(button):
+                                time.sleep(0.5)
+                                return
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # SAP/UI5 commonly closes this dialog with Escape.
+        try:
+            self.driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    def _process_all_pending_invoices(self, timeout=40, target_invoices=None):
         """
-        Process Pending Invoice rows ONE BY ONE.
+        Process every target Pending Invoice independently.
 
-        Required business flow:
+        A failure for one invoice NEVER stops the next invoice.
 
-            FIRST Pending ASN
-                -> click Pending status text
-                -> Attachment icon (ONCE)
-                -> Upload Invoice
-                -> Success popup
-                -> click OK
+        Returns:
+            {
+                "ok": True/False,
+                "completed": [invoice numbers],
+                "failed": {invoice number: reason}
+            }
 
-            NEXT Pending ASN(s)
-                -> click Pending status text
-                -> DO NOT click Attachment icon
-                -> Upload Invoice directly
-                -> Success popup
-                -> click OK
-                -> __dialog3
-                -> invoice PDF from DS_INVOICE_PATH
-                -> digital-signature checkbox
-                -> Submit Document
-                -> wait for Done
-                -> Pending Invoice again
-                -> next Pending ASN
-
-        The automation stops only when no Pending row remains. If an upload
-        fails or the status does not become Done, it stops safely and does not
-        process the same invoice again.
+        "ok" means the queue was able to inspect/attempt all target invoices.
+        It does NOT mean every invoice succeeded.
         """
         if self.driver is None:
             print("Pending invoice processing: Edge driver unavailable.")
-            return False
+            return {
+                "ok": False,
+                "completed": [],
+                "failed": {
+                    "UNKNOWN": "Edge driver is unavailable."
+                },
+            }
 
         pending_button_xpath = '//*[@id="__button1"]'
+
         processed_invoices = set()
+        completed_invoices = []
+        failed_invoices = {}
+
+        target_set = {
+            str(v).strip().upper()
+            for v in (target_invoices or [])
+            if str(v).strip()
+        }
+
         iteration = 0
+        attachment_opened = False
 
         print("=" * 70)
         print("STARTING ONE-BY-ONE PENDING INVOICE PROCESSING")
+        print("Target invoices:", sorted(target_set) if target_set else "ALL")
         print("=" * 70)
 
         while not self._stop_event.is_set():
             iteration += 1
+
             if iteration > 200:
-                print("Safety stop: more than 200 Pending processing iterations.")
-                return False
+                print(
+                    "Safety stop: more than 200 Pending processing iterations."
+                )
+                return {
+                    "ok": False,
+                    "completed": completed_invoices,
+                    "failed": failed_invoices,
+                }
 
             # ---------------------------------------------------------
-            # CLICK PENDING INVOICE FILTER AGAIN FOR EVERY NEXT ASN
+            # REFRESH PENDING INVOICE LIST
             # ---------------------------------------------------------
             try:
-                pending_button = WebDriverWait(self.driver, timeout).until(
-                    EC.element_to_be_clickable((By.XPATH, pending_button_xpath))
+                pending_button = WebDriverWait(
+                    self.driver,
+                    timeout,
+                ).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, pending_button_xpath)
+                    )
                 )
+
                 if not self._click_element_safe(pending_button):
-                    print("Could not click Pending Invoice filter.")
-                    return False
-                print(f"Pending Invoice filter clicked - iteration #{iteration}.")
+                    print(
+                        "Could not click Pending Invoice filter. "
+                        "The current Doc Upload page cannot be refreshed."
+                    )
+                    return {
+                        "ok": False,
+                        "completed": completed_invoices,
+                        "failed": failed_invoices,
+                    }
+
+                print(
+                    f"Pending Invoice filter clicked - iteration #{iteration}."
+                )
+
             except Exception as error:
-                print("Pending Invoice button failed:", repr(error))
-                return False
+                print(
+                    "Pending Invoice button failed:",
+                    repr(error),
+                )
+                return {
+                    "ok": False,
+                    "completed": completed_invoices,
+                    "failed": failed_invoices,
+                }
 
-            time.sleep(0.8)
-
-            # Give SAP/UI5 time to re-render the filtered list.
             time.sleep(0.8)
             pending_items = self._get_pending_status_snapshot()
 
-            # Remove already successfully processed invoice numbers from the
-            # current scan. This is another guard against stale UI5 rendering.
             available_items = []
+
             for item in pending_items:
-                invoice_no = str(item.get("invoice_no") or "").strip()
-                if invoice_no and invoice_no.lower() in {
-                    value.lower() for value in processed_invoices
+                invoice_no = str(
+                    item.get("invoice_no") or ""
+                ).strip()
+
+                if target_set and invoice_no.upper() not in target_set:
+                    continue
+
+                if invoice_no.upper() in {
+                    value.upper()
+                    for value in processed_invoices
                 }:
                     print(
-                        "SKIP already processed invoice:",
+                        "SKIP already attempted invoice:",
                         invoice_no,
                     )
                     continue
+
                 available_items.append(item)
 
             print(
@@ -7064,54 +7432,103 @@ class AutomationController:
             )
 
             # ---------------------------------------------------------
-            # NO PENDING LEFT -> AUTOMATION COMPLETE
+            # NO MORE AVAILABLE TARGET INVOICES
             # ---------------------------------------------------------
             if not available_items:
-                # A final fresh scan is intentionally performed before stop.
-                time.sleep(1.0)
+                time.sleep(0.8)
+
                 final_items = self._get_pending_status_snapshot()
                 final_available = []
 
                 for item in final_items:
-                    invoice_no = str(item.get("invoice_no") or "").strip()
-                    if invoice_no and invoice_no.lower() in {
-                        value.lower() for value in processed_invoices
+                    invoice_no = str(
+                        item.get("invoice_no") or ""
+                    ).strip()
+
+                    if target_set and invoice_no.upper() not in target_set:
+                        continue
+
+                    if invoice_no.upper() in {
+                        value.upper()
+                        for value in processed_invoices
                     }:
                         continue
+
                     final_available.append(item)
 
-                if not final_available:
-                    print("=" * 70)
-                    print("ALL PENDING ASN INVOICES ARE COMPLETED.")
-                    print("NO PENDING STATUS REMAINS.")
-                    print("AUTOMATION STOPPED SUCCESSFULLY.")
-                    print("=" * 70)
-                    return True
+                if final_available:
+                    available_items = final_available
+                else:
+                    processed_upper = {
+                        value.upper()
+                        for value in processed_invoices
+                    }
 
-                available_items = final_available
+                    missing = sorted(
+                        target_set - processed_upper
+                    ) if target_set else []
 
-            # ---------------------------------------------------------
-            # SELECT THE FIRST REAL PENDING ASN
-            # ---------------------------------------------------------
+                    if missing:
+                        for invoice_no in missing:
+                            failed_invoices.setdefault(
+                                invoice_no,
+                                "Mahindra Pending row was not available "
+                                "for Doc Upload.",
+                            )
+                            print(
+                                f"INVOICE FAILED: {invoice_no} | "
+                                "REASON: Mahindra Pending row was not "
+                                "available for Doc Upload."
+                            )
+
+                        return {
+                            "ok": False,
+                            "completed": completed_invoices,
+                            "failed": failed_invoices,
+                        }
+
+                    print("=" * 70)
+                    print(
+                        "ALL TARGET PENDING ASN INVOICES WERE ATTEMPTED."
+                    )
+                    print(
+                        "Completed:",
+                        completed_invoices,
+                    )
+                    print(
+                        "Failed:",
+                        failed_invoices,
+                    )
+                    print("=" * 70)
+
+                    return {
+                        "ok": True,
+                        "completed": completed_invoices,
+                        "failed": failed_invoices,
+                    }
+
             item = available_items[0]
-            invoice_no = str(item.get("invoice_no") or "").strip()
-            asn_no = str(item.get("asn_no") or "").strip()
+
+            invoice_no = str(
+                item.get("invoice_no") or ""
+            ).strip()
+
+            asn_no = str(
+                item.get("asn_no") or ""
+            ).strip()
 
             if not invoice_no:
                 print(
-                    "SAFETY STOP: Pending row has no Invoice No. Row text:",
-                    item.get("row_text", ""),
+                    "Pending row has no Invoice No. "
+                    "Skipping this row so other invoices can continue."
                 )
-                return False
+                continue
 
-            if invoice_no.lower() in {
-                value.lower() for value in processed_invoices
+            if invoice_no.upper() in {
+                value.upper()
+                for value in processed_invoices
             }:
-                print(
-                    "SAFETY STOP: Same Invoice No appeared again:",
-                    invoice_no,
-                )
-                return False
+                continue
 
             print("=" * 70)
             print("NEXT PENDING ASN SELECTED")
@@ -7121,27 +7538,86 @@ class AutomationController:
             print("=" * 70)
 
             # ---------------------------------------------------------
-            # PROCESS EXACTLY ONE PENDING ASN
+            # PROCESS EXACTLY ONE INVOICE
             # ---------------------------------------------------------
-            if not self._upload_invoice_for_pending_asn(
-                item,
-                timeout=timeout,
-                open_attachment=(iteration == 1),
-            ):
-                print("=" * 70)
-                print("PENDING INVOICE PROCESSING FAILED.")
-                print("Automation stopped safely.")
-                print("Invoice:", invoice_no)
-                print("=" * 70)
-                return False
+            try:
+                success = self._upload_invoice_for_pending_asn(
+                    item,
+                    timeout=timeout,
+                    open_attachment=not attachment_opened,
+                )
+            except Exception as error:
+                success = False
+                print(
+                    f"Invoice {invoice_no} processing raised an exception:",
+                    repr(error),
+                )
 
+            # Mark this invoice as ATTEMPTED whether it succeeded or failed.
             processed_invoices.add(invoice_no)
 
-            # Let SAP/UI5 finish changing Pending -> Done before the next scan.
+            if success:
+                completed_invoices.append(invoice_no)
+
+                # The attachment panel remains open after successful upload.
+                attachment_opened = True
+                self._attachment_panel_open = True
+
+                print(
+                    f"INVOICE COMPLETED: {invoice_no} | "
+                    "Doc Upload + Auto_Status=1 completed."
+                )
+
+            else:
+                reason = (
+                    getattr(
+                        self,
+                        "last_invoice_failure_reason",
+                        None,
+                    )
+                    or
+                    "Invoice Doc Upload failed. "
+                    "See the preceding diagnostic message(s)."
+                )
+
+                failed_invoices[invoice_no] = str(reason)
+
+                print(
+                    f"INVOICE FAILED: {invoice_no} | "
+                    f"REASON: {reason}"
+                )
+
+                # IMPORTANT:
+                # Close only the file-attachment modal. Do NOT close the
+                # Mahindra Self Service tab. This lets the next invoice run.
+                self._close_invoice_attachment_modal()
+
+                # The Attachment panel itself should normally remain open.
+                # If the panel/status control was not reached, allow the next
+                # invoice to open it again.
+                reason_upper = str(reason).upper()
+                if (
+                    "ATTACHMENT" in reason_upper
+                    and (
+                        "NOT FOUND" in reason_upper
+                        or "FAILED" in reason_upper
+                    )
+                ) or "PENDING STATUS" in reason_upper:
+                    attachment_opened = False
+                    self._attachment_panel_open = False
+                else:
+                    attachment_opened = True
+
+            # Give SAP/UI5 time to finish before reading the next Pending row.
             time.sleep(1.0)
 
         print("Pending invoice processing stopped by stop event.")
-        return False
+
+        return {
+            "ok": False,
+            "completed": completed_invoices,
+            "failed": failed_invoices,
+        }
 
     def _click_pending_invoice_and_attachment(self, timeout=30):
         """Compatibility wrapper for existing callers.
@@ -7175,7 +7651,7 @@ class AutomationController:
                returning True.
 
         This method is used for both:
-            From Date = today - 2 days
+            From Date = today
             To Date   = today
         """
         if self.driver is None:
@@ -8339,8 +8815,18 @@ class AutomationController:
             current_uids = data[0].split()
             print("Mailbox contains", len(current_uids), "messages.")
 
-            # Newest first. Check enough recent mail to handle delivery delays.
-            ordered_uids = list(reversed(current_uids[-30:]))
+            # IMPORTANT:
+            # Do not use "newest email wins" for OTPs.
+            #
+            # Mahindra can generate more than one OTP around the same login
+            # attempt. Mail delivery can also arrive out of order. The OTP
+            # shown in the browser belongs to the OTP request that started
+            # this login flow, so selecting the absolute newest email can
+            # incorrectly enter a later OTP.
+            #
+            # Keep the mailbox order (oldest -> newest) for the new UIDs and
+            # select the first newly-arrived matching Mahindra OTP.
+            ordered_uids = list(current_uids[-30:])
 
             login_time = (
                 self.otp_wait_started

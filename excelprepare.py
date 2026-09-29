@@ -262,7 +262,9 @@ ASN_COLUMNS = [
 #
 # AUTO_STATUS = 0
 #
-# Therefore every pending invoice will be exported.
+# Billing_Name = MAHINDRA AND MAHINDRA LIMITED
+#
+# Therefore only pending Mahindra & Mahindra invoices will be exported.
 #
 # =============================================================================
 
@@ -304,6 +306,7 @@ INNER JOIN IRPEWBInvoice I
     ON D.DocNo = I.DocNo
 
 WHERE I.AUTO_STATUS = 0
+  AND LTRIM(RTRIM(ISNULL(I.Billing_Name, ''))) = 'MAHINDRA AND MAHINDRA LIMITED'
 
 ORDER BY I.DocDate, I.DocNo;
 """
@@ -444,6 +447,9 @@ def fetch_pending_invoice_data():
         print(
             "FILTER  : AUTO_STATUS = 0"
         )
+        print(
+            "FILTER  : Billing_Name = MAHINDRA AND MAHINDRA LIMITED"
+        )
 
         print("=" * 80)
 
@@ -482,7 +488,8 @@ def fetch_pending_invoice_data():
             print("=" * 80)
 
             print(
-                "No records found where AUTO_STATUS = 0."
+                "No records found where AUTO_STATUS = 0 "
+                "and Billing_Name = MAHINDRA AND MAHINDRA LIMITED."
             )
 
             return dataframe
@@ -1389,7 +1396,8 @@ def prepare_new_asn_file():
         print("NO DATABASE DATA")
         print("=" * 80)
         print(
-            "No records found where AUTO_STATUS = 0."
+            "No records found where AUTO_STATUS = 0 "
+            "and Billing_Name = MAHINDRA AND MAHINDRA LIMITED."
         )
         print(
             "NO EXCEL/CSV CREATED."

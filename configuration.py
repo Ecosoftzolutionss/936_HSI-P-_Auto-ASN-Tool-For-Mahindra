@@ -460,6 +460,8 @@ class ConfigurationPage(QWidget):
             # -----------------------------
             # dbo.SETTINGS
             # -----------------------------
+            # First try the current Windows computer name.
+            # This keeps multi-system installations working.
             cursor.execute(
                 """
                 SELECT TOP 1
@@ -471,13 +473,41 @@ class ConfigurationPage(QWidget):
                     PORTAL_USERID,
                     PORTAL_PASSWORD
                 FROM dbo.SETTINGS
+                WHERE LTRIM(RTRIM(SYSTEM_NAME)) = LTRIM(RTRIM(?))
                 ORDER BY ID DESC
                 """,
+                self.system_name,
             )
             settings_row = cursor.fetchone()
 
+            # IMPORTANT: If the database row exists but SYSTEM_NAME is not
+            # exactly the same as platform.node(), do not show blank fields.
+            # Load the latest SETTINGS row as a safe fallback.
+            if not settings_row:
+                cursor.execute(
+                    """
+                    SELECT TOP 1
+                        ID,
+                        SYSTEM_NAME,
+                        DS_INVOICE_PATH,
+                        F_PATH,
+                        ASN_BARCODE_PATH,
+                        PORTAL_USERID,
+                        PORTAL_PASSWORD
+                    FROM dbo.SETTINGS
+                    ORDER BY ID DESC
+                    """
+                )
+                settings_row = cursor.fetchone()
+
             if settings_row:
                 self.settings_id = int(settings_row[0])
+
+                # Use the database system name after loading an existing row.
+                # Future updates are done by ID, so the hostname mismatch is
+                # no longer a problem.
+                self.system_name = str(settings_row[1] or self.system_name).strip()
+
                 self.invoice_path.setText(str(settings_row[2] or ""))
                 self.flatfile_path.setText(str(settings_row[3] or ""))
                 self.asn_barcode_path.setText(str(settings_row[4] or ""))
@@ -508,6 +538,25 @@ class ConfigurationPage(QWidget):
             )
             mail_row = cursor.fetchone()
 
+            # If an old installation has a row but IsActive is not set
+            # correctly, still display the latest saved mail configuration.
+            if not mail_row:
+                cursor.execute(
+                    """
+                    SELECT TOP 1
+                        Id,
+                        MailServer,
+                        MailPort,
+                        EmailId,
+                        EmailPassword,
+                        OtpSubject,
+                        OtpSender
+                    FROM dbo.MailSettings
+                    ORDER BY Id DESC
+                    """
+                )
+                mail_row = cursor.fetchone()
+
             if mail_row:
                 self.mail_settings_id = int(mail_row[0])
                 self.mail_server.setText(str(mail_row[1] or ""))
@@ -533,6 +582,18 @@ class ConfigurationPage(QWidget):
                 cursor.close()
             if connection:
                 connection.close()
+
+    # =========================================================
+    # Message / focus helper
+    # =========================================================
+
+    def warn(self, message, widget=None):
+        """Show a validation message and focus the invalid field."""
+        QMessageBox.warning(self, "Validation", message)
+        if widget is not None:
+            widget.setFocus()
+            if isinstance(widget, QLineEdit):
+                widget.selectAll()
 
     # =========================================================
     # Validation
@@ -605,15 +666,29 @@ class ConfigurationPage(QWidget):
             cursor = connection.cursor()
 
             if self.settings_id is None:
+                # Check for an exact system row first.
                 cursor.execute(
                     """
                     SELECT TOP 1 ID
                     FROM dbo.SETTINGS
+                    WHERE LTRIM(RTRIM(SYSTEM_NAME)) = LTRIM(RTRIM(?))
                     ORDER BY ID DESC
                     """,
                     self.system_name,
                 )
                 existing = cursor.fetchone()
+
+                # If there is already a configuration row for this
+                # application, reuse it instead of inserting a duplicate.
+                if not existing:
+                    cursor.execute(
+                        """
+                        SELECT TOP 1 ID
+                        FROM dbo.SETTINGS
+                        ORDER BY ID DESC
+                        """
+                    )
+                    existing = cursor.fetchone()
 
                 if existing:
                     self.settings_id = int(existing[0])
@@ -650,6 +725,7 @@ class ConfigurationPage(QWidget):
                         WHERE SYSTEM_NAME = ?
                         ORDER BY ID DESC
                         """,
+                        self.system_name,
                     )
                     row = cursor.fetchone()
                     if row:
