@@ -53,6 +53,7 @@ import imaplib
 import threading
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -113,6 +114,20 @@ EDGE_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"
 )
+
+# ---------------------------------------------------------------------------
+# EDGE WINDOW / PORTAL UI PROTECTION
+# ---------------------------------------------------------------------------
+EDGE_SAFE_WIDTH = 1200
+EDGE_SAFE_HEIGHT = 720
+
+COOKIE_ACCEPT_XPATH = "/html/body/div[2]/div[2]/a[1]"
+COOKIE_CLOSE_XPATHS = (
+    "//span[contains(@class,'cc-close-banner-btn')]",
+    "//span[contains(@class,'cc-close')]",
+    "//button[contains(@aria-label,'Close')]",
+)
+
 
 try:
     import pyautogui
@@ -280,10 +295,15 @@ class AutomationController:
         self.otp_thread = None
         self.dashboard_thread = None
         self.winsec_thread = None
+        self.browser_ui_thread = None
+        # HWND of the exact Edge window created/controlled by Selenium.
+        # Never let the watcher operate on another Chromium application.
+        self._edge_target_hwnd = 0
 
         self._stop_event = threading.Event()
         self._running = False
         self._winsec_watcher_active = False
+        self._browser_ui_watcher_active = False
         self.last_invoice_failure_reason = None
         self._attachment_panel_open = False
 
@@ -360,6 +380,10 @@ class AutomationController:
             print("Current Edge URL:", self.driver.current_url)
 
             time.sleep(3)
+
+            # Accept the Mahindra cookie banner before locating the login
+            # controls. The exact Accept All Cookies XPath is handled below.
+            self._handle_cookie_banner()
 
             # Capture mailbox state BEFORE requesting OTP.
             self.otp_baseline_uids = self._get_mail_uids()
@@ -464,25 +488,13 @@ class AutomationController:
         # -------------------------------------------------------------
         # DOWNLOAD DIRECTORY
         # -------------------------------------------------------------
-        # ASN Barcode PDF is a best-effort step after ASN row validation.
-        # Edge startup may therefore proceed even if the barcode destination
-        # is not configured; the failure is reported in the user log and the
-        # invoice-by-invoice Doc Upload flow continues.
-        #
-        # F_PATH is already the configured HSI automation folder, so use it
-        # as the general Edge download directory.
-        f_path = self._get_asn_file_path_from_db()
-
-        if f_path:
-            download_dir = os.path.abspath(
-                os.path.expandvars(
-                    f_path.strip('\"').strip("'").strip()
-                )
-            )
+        # IMPORTANT FIX: ASN Barcode uses ASN_BARCODE_PATH, not F_PATH.
+        barcode_path = self._get_asn_barcode_path_from_db()
+        if barcode_path:
+            download_dir = os.path.abspath(os.path.expandvars(barcode_path.strip('"').strip("'").strip()))
         else:
-            download_dir = os.path.abspath(
-                os.path.join(os.getcwd(), "output")
-            )
+            download_dir = os.path.abspath(os.path.join(os.getcwd(), "output", "ASNBarcode"))
+            print("WARNING: ASN_BARCODE_PATH is not configured. Using local fallback:", download_dir)
 
         try:
             os.makedirs(download_dir, exist_ok=True)
@@ -534,78 +546,291 @@ class AutomationController:
         print("External Edge URL:", self.driver.current_url)
         print("External Edge title:", self.driver.title)
 
+        # Capture the exact Edge HWND only after the Mahindra page has loaded.
+        # This prevents the watcher from selecting an already-open Edge window.
         self._bring_browser_to_front()
+        self._start_browser_ui_watcher()
 
     def _bring_browser_to_front(self):
-        """Bring the Selenium-controlled Edge window to the foreground."""
-
+        """Bring ONLY the Selenium-controlled Edge window to the foreground."""
         try:
             if self.driver is None:
                 return
-
-            self.driver.switch_to.window(
-                self.driver.current_window_handle
-            )
-
+            self.driver.switch_to.window(self.driver.current_window_handle)
             try:
                 self.driver.execute_script("window.focus();")
             except Exception:
                 pass
-
             if sys.platform == "win32":
-                try:
+                hwnd = self._get_edge_hwnd()
+                if hwnd:
                     user32 = ctypes.windll.user32
-                    from ctypes import wintypes
-
-                    edge_hwnd = {"value": 0}
-
-                    @ctypes.WINFUNCTYPE(
-                        ctypes.c_bool,
-                        wintypes.HWND,
-                        wintypes.LPARAM,
-                    )
-                    def enum_proc(hwnd, _):
-                        if not user32.IsWindowVisible(hwnd):
-                            return True
-
-                        length = user32.GetWindowTextLengthW(hwnd)
-                        if length <= 0:
-                            return True
-
-                        buffer = ctypes.create_unicode_buffer(length + 1)
-                        user32.GetWindowTextW(
-                            hwnd,
-                            buffer,
-                            length + 1,
-                        )
-
-                        title = buffer.value.strip().lower()
-
-                        if "edge" in title:
-                            edge_hwnd["value"] = hwnd
-                            return False
-
-                        return True
-
-                    user32.EnumWindows(enum_proc, 0)
-
-                    if edge_hwnd["value"]:
-                        user32.ShowWindow(
-                            edge_hwnd["value"],
-                            9,
-                        )
-                        user32.SetForegroundWindow(
-                            edge_hwnd["value"]
-                        )
-
-                except Exception as win_error:
-                    print(
-                        "Edge foreground warning:",
-                        repr(win_error),
-                    )
-
+                    user32.ShowWindow(hwnd, 9)
+                    user32.SetForegroundWindow(hwnd)
+                    self._edge_target_hwnd = hwnd
         except Exception as error:
             print("Could not focus Edge:", repr(error))
+
+    # ------------------------------------------------------------------------
+    # BROWSER UI WATCHER
+    # ------------------------------------------------------------------------
+
+    def _start_browser_ui_watcher(self):
+        """Start native Edge popup + portrait-mode protection."""
+        if self._browser_ui_watcher_active:
+            return
+
+        self._browser_ui_watcher_active = True
+        self.browser_ui_thread = threading.Thread(
+            target=self._browser_ui_loop,
+            daemon=True,
+            name="EdgeUIWatcher",
+        )
+        self.browser_ui_thread.start()
+
+    def _stop_browser_ui_watcher(self):
+        self._browser_ui_watcher_active = False
+
+    def _browser_ui_loop(self):
+        """
+        Watch the REAL Edge window, not the website DOM.
+
+        Handles:
+          1. Edge's native "Sign in to Microsoft Edge" bubble.
+          2. Portrait/narrow Edge windows that make Mahindra display
+             "Portal can't be seen in the Portrait Mode".
+        """
+        while (
+            self._browser_ui_watcher_active
+            and not self._stop_event.is_set()
+        ):
+            try:
+                self._dismiss_edge_signin_popup()
+            except Exception as error:
+                print("Edge sign-in popup watcher warning:", repr(error))
+
+            try:
+                self._keep_edge_landscape()
+            except Exception as error:
+                print("Edge landscape watcher warning:", repr(error))
+
+            time.sleep(0.8)
+
+    def _dismiss_edge_signin_popup(self):
+        """Dismiss the Edge sign-in bubble only inside our Edge window."""
+        if sys.platform != "win32":
+            return False
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            return False
+        hwnd = self._get_edge_hwnd()
+        if not hwnd:
+            return False
+        script = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$target = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]TARGET_HWND)
+if ($null -eq $target) { exit 0 }
+$condition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::NameProperty,
+    "No, thanks"
+)
+$buttons = $target.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    $condition
+)
+foreach ($button in $buttons) {
+    try {
+        $pattern = $button.GetCurrentPattern(
+            [System.Windows.Automation.InvokePattern]::Pattern
+        )
+        $pattern.Invoke()
+        Write-Output "CLICKED"
+        exit 0
+    } catch { }
+}
+""".replace("TARGET_HWND", str(hwnd))
+        try:
+            result = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2.5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if "CLICKED" in (result.stdout or ""):
+                print('Microsoft Edge popup: "No, thanks" clicked.')
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _get_edge_hwnd(self):
+        """Return the HWND for the actual msedge.exe window used by Selenium."""
+        if sys.platform != "win32":
+            return 0
+        try:
+            user32 = ctypes.windll.user32
+            from ctypes import wintypes
+            candidates=[]
+            PROCESS_QUERY_LIMITED_INFORMATION=0x1000
+            def process_image(pid):
+                handle=user32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,False,pid)
+                if not handle: return ""
+                try:
+                    size=wintypes.DWORD(32768); buffer=ctypes.create_unicode_buffer(size.value)
+                    if user32.QueryFullProcessImageNameW(handle,0,buffer,ctypes.byref(size)): return buffer.value.lower()
+                finally: user32.CloseHandle(handle)
+                return ""
+            @ctypes.WINFUNCTYPE(ctypes.c_bool,wintypes.HWND,wintypes.LPARAM)
+            def enum_proc(hwnd,_):
+                if not user32.IsWindowVisible(hwnd): return True
+                length=user32.GetWindowTextLengthW(hwnd); title=""
+                if length>0:
+                    buffer=ctypes.create_unicode_buffer(length+1); user32.GetWindowTextW(hwnd,buffer,length+1); title=buffer.value.strip().lower()
+                class_buf=ctypes.create_unicode_buffer(256); user32.GetClassNameW(hwnd,class_buf,256)
+                if class_buf.value!="Chrome_WidgetWin_1": return True
+                pid=wintypes.DWORD(); user32.GetWindowThreadProcessId(hwnd,ctypes.byref(pid)); image=process_image(pid.value)
+                if image.endswith("\\msedge.exe") or image.endswith("/msedge.exe"): candidates.append((hwnd,title))
+                return True
+            user32.EnumWindows(enum_proc,0)
+            if not candidates: return 0
+            for hwnd,_ in candidates:
+                if hwnd==self._edge_target_hwnd: return hwnd
+            current_title=""
+            try: current_title=(self.driver.title or "").strip().lower() if self.driver else ""
+            except Exception: pass
+            if current_title:
+                for hwnd,title in candidates:
+                    if current_title in title:
+                        self._edge_target_hwnd=hwnd; return hwnd
+            self._edge_target_hwnd=candidates[0][0]
+            return self._edge_target_hwnd
+        except Exception as error:
+            print("Edge HWND detection warning:",repr(error)); return 0
+
+    def _keep_edge_landscape(self):
+        """
+        Restore a landscape browser window if the user makes Edge portrait.
+        This is independent of Selenium DOM operations.
+        """
+        hwnd = self._get_edge_hwnd()
+        if not hwnd:
+            return False
+
+        user32 = ctypes.windll.user32
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+
+        # Ignore minimized windows.
+        if width <= 0 or height <= 0:
+            return False
+
+        if width >= height and width >= 1000:
+            return False
+
+        screen_width = user32.GetSystemMetrics(0)
+        screen_height = user32.GetSystemMetrics(1)
+
+        target_width = min(EDGE_SAFE_WIDTH, max(1000, screen_width - 40))
+        target_height = min(EDGE_SAFE_HEIGHT, max(650, screen_height - 80))
+
+        # Force target dimensions to remain landscape.
+        if target_width <= target_height:
+            target_width, target_height = target_height + 120, target_width
+
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetWindowPos(
+            hwnd,
+            0,
+            max(0, (screen_width - target_width) // 2),
+            max(0, (screen_height - target_height) // 2),
+            target_width,
+            target_height,
+            0x0040,  # SWP_SHOWWINDOW
+        )
+
+        print(
+            f"Edge portrait mode detected ({width}x{height}). "
+            f"Restored to landscape ({target_width}x{target_height})."
+        )
+        return True
+
+    def _handle_cookie_banner(self):
+        """
+        Accept the Mahindra cookie banner using the exact XPath supplied.
+
+        Accept All Cookies:
+            /html/body/div[2]/div[2]/a[1]
+
+        If the banner remains after accepting, click its close X.
+        """
+        if self.driver is None or By is None:
+            return False
+
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
+        try:
+            element = WebDriverWait(self.driver, 5).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, COOKIE_ACCEPT_XPATH)
+                )
+            )
+
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});",
+                element,
+            )
+
+            try:
+                element.click()
+            except Exception:
+                self.driver.execute_script(
+                    "arguments[0].click();",
+                    element,
+                )
+
+            print("Mahindra cookie banner: Accept all cookies clicked.")
+            time.sleep(0.5)
+        except Exception:
+            # Banner may already be accepted/not present.
+            return False
+
+        for xpath in COOKIE_CLOSE_XPATHS:
+            try:
+                close_button = WebDriverWait(self.driver, 1.5).until(
+                    EC.element_to_be_clickable((By.XPATH, xpath))
+                )
+                try:
+                    close_button.click()
+                except Exception:
+                    self.driver.execute_script(
+                        "arguments[0].click();",
+                        close_button,
+                    )
+                print("Mahindra cookie banner: close X clicked.")
+                break
+            except Exception:
+                continue
+
+        return True
 
     # ------------------------------------------------------------------------
     # WINDOWS SECURITY WATCHER
@@ -3388,6 +3613,7 @@ class AutomationController:
             item: ['itemno','itemsrno','item'],
             part: ['partno','partnumber','part'],
             qty: ['quantity','asnquantity','qty'],
+            asn: ['asno','asnnumber','asn'],
             error: ['errorifany','error','message','errormessage']
           };
           const findIndex = (headers, names) => headers.findIndex(h => names.includes(canon(h)));
@@ -3402,7 +3628,8 @@ class AutomationController:
               const headers = {
                 invoice: findIndex(cells, aliases.invoice), order: findIndex(cells, aliases.order),
                 item: findIndex(cells, aliases.item), part: findIndex(cells, aliases.part),
-                qty: findIndex(cells, aliases.qty), error: findIndex(cells, aliases.error)
+                qty: findIndex(cells, aliases.qty), asn: findIndex(cells, aliases.asn),
+                error: findIndex(cells, aliases.error)
               };
               if (headers.invoice >= 0 && (headers.error >= 0 || headers.part >= 0 || headers.qty >= 0)) {
                 headerIndex = r; idx = headers; break;
@@ -3415,7 +3642,7 @@ class AutomationController:
               const invoice = cells[idx.invoice] || '';
               if (!invoice || !/^[A-Za-z0-9/_-]{3,50}$/.test(invoice)) continue;
               const get = k => idx[k] >= 0 && idx[k] < cells.length ? cells[idx[k]] : '';
-              out.push({invoice_no: invoice, order_no:get('order'), item_no:get('item'), part_no:get('part'), quantity:get('qty'), error:get('error')});
+              out.push({invoice_no: invoice, order_no:get('order'), item_no:get('item'), part_no:get('part'), quantity:get('qty'), asn_no:get('asn'), error:get('error')});
             }
           }
           return out;
@@ -3431,7 +3658,7 @@ class AutomationController:
         # Fallback: invoice numbers from page text, with no row-level error data.
         try:
             body = self.driver.find_element(By.TAG_NAME, "body").text or ""
-            return [{"invoice_no": x, "order_no":"", "item_no":"", "part_no":"", "quantity":"", "error":""}
+            return [{"invoice_no": x, "order_no":"", "item_no":"", "part_no":"", "quantity":"", "asn_no":"", "error":""}
                     for x in dict.fromkeys(re.findall(r"\bP\d{6,20}\b", body, re.I))]
         except Exception:
             return []
@@ -3708,32 +3935,63 @@ class AutomationController:
         self.created_asn_invoice_numbers = list(successful_invoices)
 
         print(
+            "ASN CREATION COMPLETED | "
+            f"{len(successful_invoices)} invoice(s) created successfully."
+        )
+        print(
             "Successful ASN invoices:",
             self.created_asn_invoice_numbers,
         )
 
         # -------------------------------------------------------------
-        # BARCODE = BEST EFFORT
+        # SAVE ASN RESULT + INITIAL DATABASE STATUS
         # -------------------------------------------------------------
-        # A Barcode PDF problem must be visible to the user, but it must NOT
-        # stop successful invoices from reaching the one-by-one Doc Upload flow.
-        barcode_ok = self._download_asn_barcode(timeout=60)
+        response_by_invoice = {
+            str(row.get("invoice_no") or "").strip().upper(): row
+            for row in response_rows
+            if str(row.get("invoice_no") or "").strip()
+        }
 
+        for successful_row in successful_rows:
+            invoice_no = str(successful_row.get("Invoice No") or "").strip()
+            actual = response_by_invoice.get(invoice_no.upper(), {})
+            asn_no = str(actual.get("asn_no") or "").strip()
+            if not invoice_no:
+                print("ASN CREATION DATABASE UPDATE FAILED | Invoice No is empty.")
+                return False
+            if not asn_no:
+                self.last_invoice_failure_reason = f"Mahindra ASN No was not returned for Invoice {invoice_no}."
+                print("ASN CREATION DATABASE UPDATE FAILED")
+                print("Invoice No :",invoice_no)
+                print("Reason     : ASN No is empty in Mahindra result grid.")
+                return False
+            if not self._update_invoice_asn_creation_status(invoice_no,asn_no):
+                self.last_invoice_failure_reason = f"ASN No/status update failed for Invoice {invoice_no} with ASN {asn_no}."
+                return False
+
+        print("ASN No, ApplicationDSStatus=FALSE, Auto_Status=FALSE and CreatedDate updated for all successful invoices.")
+
+        # -------------------------------------------------------------
+        # BARCODE = BEST-EFFORT DOWNLOAD
+        # -------------------------------------------------------------
+        barcode_ok = self._download_asn_barcode(timeout=60)
         if not barcode_ok:
-            print(
-                "ASN BARCODE DOWNLOAD FAILED | "
-                "REASON: Barcode PDF could not be downloaded. "
-                "Continuing with invoice-by-invoice Doc Upload."
-            )
+            print("ASN BARCODE DOWNLOAD FAILED | REASON: Barcode PDF could not be confirmed. Continuing with invoice Doc Upload.")
         else:
-            print(
-                "ASN BARCODE DOWNLOAD COMPLETED:",
-                self.asn_barcode_download_dir,
-            )
+            print("ASN BARCODE DOWNLOAD COMPLETED:",self.asn_barcode_download_dir)
 
         # -------------------------------------------------------------
         # DOC UPLOAD = ONE INVOICE AT A TIME
         # -------------------------------------------------------------
+        print(
+            "STARTING INVOICE DOC UPLOAD | "
+            f"Total invoices to process: {len(successful_invoices)}"
+        )
+        print(
+            "Invoice PDFs will be searched in DS_INVOICE_PATH "
+            "for each invoice individually."
+        )
+
         doc_result = self._open_doc_upload_and_search(
             successful_invoices,
             timeout=60,
@@ -4126,7 +4384,6 @@ class AutomationController:
             if isinstance(result, list):
                 for value in result:
                     value = str(value or '').strip()
-
                     # Mahindra invoice numbers in the current page are like
                     # P26101166. Keep the filter broad enough for future data.
                     if re.fullmatch(r'[A-Za-z0-9/_-]{3,50}', value):
@@ -4215,6 +4472,64 @@ class AutomationController:
         )
 
         return pyodbc.connect(connection_string)
+
+    def _update_invoice_asn_creation_status(self, invoice_no, asn_no):
+        """Save ASN No plus initial database state immediately after ASN creation."""
+        invoice_no=str(invoice_no or "").strip(); asn_no=str(asn_no or "").strip()
+        if not invoice_no or not asn_no:
+            print("ASN creation DB update skipped: Invoice No or ASN No is empty."); return False
+        connection=None; cursor=None
+        try:
+            print("STEP 10: SAVING ASN CREATION STATUS")
+            print(f"Invoice No : {invoice_no}"); print(f"ASN No     : {asn_no}")
+            print("Target     : APIMessage=ASN No | ApplicationDSStatus=FALSE | Auto_Status=FALSE | CreatedDate=NOW")
+            connection=self._get_source_db_connection(); cursor=connection.cursor()
+            cursor.execute("SELECT DocNo FROM dbo.IRPEWBInvoice WHERE DocNo = ?",invoice_no)
+            if cursor.fetchone() is None:
+                connection.rollback(); print(f"ERROR: Invoice {invoice_no} was not found in dbo.IRPEWBInvoice."); return False
+            cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='IRPEWBInvoice'")
+            columns={str(r[0]).lower():str(r[0]) for r in cursor.fetchall()}
+            if "apimessage" not in columns:
+                raise RuntimeError("dbo.IRPEWBInvoice.APIMessage column is required to store the Mahindra ASN No.")
+            set_parts=[f"[{columns['apimessage']}] = ?"]; params=[asn_no]
+            if "applicationdsstatus" in columns: set_parts.append(f"[{columns['applicationdsstatus']}] = 0")
+            else: print("WARNING: ApplicationDSStatus column is not present; skipped.")
+            if "auto_status" in columns: set_parts.append(f"[{columns['auto_status']}] = 0")
+            else: print("WARNING: Auto_Status column is not present; skipped.")
+            if "createddate" in columns: set_parts.append(f"[{columns['createddate']}] = GETDATE()")
+            else: print("WARNING: CreatedDate column is not present; skipped.")
+            params.append(invoice_no)
+            cursor.execute(f"UPDATE dbo.IRPEWBInvoice SET {', '.join(set_parts)} WHERE DocNo = ?",params)
+            if cursor.rowcount != 1:
+                connection.rollback(); print(f"ERROR: ASN creation update affected {cursor.rowcount} row(s) for Invoice {invoice_no}."); return False
+            connection.commit()
+            verify=[f"[{columns['apimessage']}] AS APIMessage"]
+            if "applicationdsstatus" in columns: verify.append(f"[{columns['applicationdsstatus']}] AS ApplicationDSStatus")
+            if "auto_status" in columns: verify.append(f"[{columns['auto_status']}] AS Auto_Status")
+            if "createddate" in columns: verify.append(f"[{columns['createddate']}] AS CreatedDate")
+            cursor.execute(f"SELECT {', '.join(verify)} FROM dbo.IRPEWBInvoice WHERE DocNo = ?",invoice_no)
+            row=cursor.fetchone()
+            if row is None or str(row[0] or "").strip()!=asn_no:
+                print(f"ERROR: ASN No verification failed. Expected={asn_no!r}, Actual={str(row[0] or '').strip() if row else None!r}"); return False
+            print(f"ASN CREATION DB UPDATE VERIFIED: Invoice {invoice_no} -> ASN {asn_no}")
+            print("ApplicationDSStatus = FALSE"); print("Auto_Status = FALSE"); print("CreatedDate = current database date/time")
+            return True
+        except Exception as error:
+            if connection is not None:
+                try: connection.rollback()
+                except Exception: pass
+            print("ASN creation database update failed:",type(error).__name__,repr(error)); return False
+        finally:
+            try:
+                if cursor is not None: cursor.close()
+            except Exception: pass
+            try:
+                if connection is not None: connection.close()
+            except Exception: pass
+
+    def _update_invoice_api_message(self, invoice_no, asn_no):
+        """Backward-compatible wrapper."""
+        return self._update_invoice_asn_creation_status(invoice_no,asn_no)
 
     def _update_invoice_auto_status(self, invoice_numbers, auto_status=1):
         """
@@ -4465,6 +4780,7 @@ class AutomationController:
                 repr(error),
             )
 
+        print("ASN BARCODE DOWNLOAD STARTED")
         print("STEP 11: Clicking Download ASN Barcode...")
         print("Download ASN Barcode XPath:", download_xpath)
         print("ASN Barcode PDF folder:", download_dir)
@@ -4592,6 +4908,7 @@ class AutomationController:
                         file_size = 0
 
                     if file_size > 0:
+                        print("ASN BARCODE DOWNLOAD COMPLETED")
                         print("ASN Barcode PDF downloaded successfully:")
                         print("PDF:", downloaded_pdf)
                         print("Size:", file_size, "bytes")
@@ -4684,8 +5001,8 @@ class AutomationController:
         """
         Read ASN_BARCODE_PATH from dbo.SETTINGS.
 
-        The current workflow skips ASN Barcode PDF download. This method is
-        retained for compatibility with the existing barcode-download method.
+        This path is used exclusively for the Mahindra ASN Barcode PDF.
+        It must never be replaced by F_PATH (the ASN flat-file queue folder).
         """
         connection = None
         cursor = None
@@ -6241,6 +6558,57 @@ class AutomationController:
         print("=" * 70)
 
         # -------------------------------------------------------------
+        # 0. VALIDATE THIS INVOICE PDF BEFORE TOUCHING THE PORTAL
+        # -------------------------------------------------------------
+        # Each invoice is checked independently against DS_INVOICE_PATH.
+        # If the ORIGINAL PDF is missing, show a clear invoice-specific
+        # message and continue with the next Pending invoice.
+        ds_invoice_path = self._get_ds_invoice_path_from_db()
+
+        if not ds_invoice_path:
+            self.last_invoice_failure_reason = (
+                f"Invoice {invoice_no}: invoice PDF path is not configured. "
+                "Please configure DS_INVOICE_PATH in Configuration."
+            )
+            print(
+                f"INVOICE PDF PATH NOT CONFIGURED | Invoice No: {invoice_no} | "
+                "DS_INVOICE_PATH is missing."
+            )
+            return False
+
+        print(
+            f"INVOICE FILE SEARCH STARTED | Invoice No: {invoice_no} | "
+            f"Search Path: {ds_invoice_path}"
+        )
+
+        invoice_file = self._find_invoice_file(
+            invoice_no,
+            ds_invoice_path,
+        )
+
+        if not invoice_file:
+            expected_name = f"{invoice_no}ORIGINALINVOICE.pdf"
+            self.last_invoice_failure_reason = (
+                f"Invoice {invoice_no}: ORIGINAL invoice PDF not found. "
+                f"Expected file: {expected_name}. "
+                f"Search path: {ds_invoice_path}"
+            )
+            print(
+                f"INVOICE PDF NOT FOUND | Invoice No: {invoice_no} | "
+                f"Expected: {expected_name} | Search Path: {ds_invoice_path}"
+            )
+            print(
+                f"INVOICE SKIPPED | Invoice No: {invoice_no} | "
+                "The next invoice will be processed."
+            )
+            return False
+
+        print(
+            f"INVOICE PDF FOUND | Invoice No: {invoice_no} | "
+            f"File: {invoice_file}"
+        )
+
+        # -------------------------------------------------------------
         # 1. CLICK THE ACTUAL PENDING STATUS TEXT
         # -------------------------------------------------------------
         status_xpath = (
@@ -6361,31 +6729,6 @@ class AutomationController:
                 "File Attachment modal was not found after clicking Upload Invoice."
             )
             print("File Attachment modal was not found:", repr(error))
-            return False
-
-        # -------------------------------------------------------------
-        # 5. GET DS_INVOICE_PATH AND FIND INVOICE PDF
-        # -------------------------------------------------------------
-        ds_invoice_path = self._get_ds_invoice_path_from_db()
-        if not ds_invoice_path:
-            self.last_invoice_failure_reason = (
-                "DS_INVOICE_PATH is missing or not configured."
-            )
-            print("Cannot upload invoice: DS_INVOICE_PATH is missing.")
-            return False
-
-        invoice_file = self._find_invoice_file(
-            invoice_no,
-            ds_invoice_path,
-        )
-        if not invoice_file:
-            self.last_invoice_failure_reason = (
-                f"ORIGINAL invoice PDF not found for {invoice_no}. "
-                f"Expected {invoice_no}ORIGINALINVOICE.pdf in DS_INVOICE_PATH."
-            )
-            print(
-                f"Cannot upload Invoice {invoice_no}: ORIGINAL invoice PDF not found."
-            )
             return False
 
         # -------------------------------------------------------------
@@ -7234,8 +7577,12 @@ class AutomationController:
         print("ASN No     :", asn_no)
         print("Invoice No :", invoice_no)
 
+        # APIMessage was already updated immediately after successful ASN
+        # Barcode download in _process_current_asn_upload_page().
+
         # AUTO_STATUS is invoice-based and is updated ONLY after the
-        # Mahindra Doc Upload success popup has been acknowledged.
+        # Mahindra Doc Upload success popup has been acknowledged AND the
+        # ASN number has been saved successfully in APIMessage.
         if not self._update_invoice_auto_status([invoice_no], auto_status=1):
             self.last_invoice_failure_reason = (
                 f"Auto_Status=1 update/verification failed for Invoice {invoice_no}."
@@ -7347,6 +7694,10 @@ class AutomationController:
         print("=" * 70)
         print("STARTING ONE-BY-ONE PENDING INVOICE PROCESSING")
         print("Target invoices:", sorted(target_set) if target_set else "ALL")
+        print(
+            "Each invoice is validated against DS_INVOICE_PATH before "
+            "Upload Invoice is clicked."
+        )
         print("=" * 70)
 
         while not self._stop_event.is_set():
@@ -7488,17 +7839,14 @@ class AutomationController:
                         }
 
                     print("=" * 70)
+                    print("ALL TARGET PENDING ASN INVOICES WERE ATTEMPTED.")
                     print(
-                        "ALL TARGET PENDING ASN INVOICES WERE ATTEMPTED."
+                        "INVOICE PROCESS SUMMARY | "
+                        f"Completed: {len(completed_invoices)} | "
+                        f"Failed: {len(failed_invoices)}"
                     )
-                    print(
-                        "Completed:",
-                        completed_invoices,
-                    )
-                    print(
-                        "Failed:",
-                        failed_invoices,
-                    )
+                    print("Completed:", completed_invoices)
+                    print("Failed:", failed_invoices)
                     print("=" * 70)
 
                     return {
@@ -7564,7 +7912,7 @@ class AutomationController:
                 self._attachment_panel_open = True
 
                 print(
-                    f"INVOICE COMPLETED: {invoice_no} | "
+                    f"INVOICE COMPLETED | Invoice No: {invoice_no} | "
                     "Doc Upload + Auto_Status=1 completed."
                 )
 
@@ -7583,7 +7931,7 @@ class AutomationController:
                 failed_invoices[invoice_no] = str(reason)
 
                 print(
-                    f"INVOICE FAILED: {invoice_no} | "
+                    f"INVOICE FAILED | Invoice No: {invoice_no} | "
                     f"REASON: {reason}"
                 )
 
@@ -9185,6 +9533,7 @@ class AutomationController:
         print("Cleaning up Mahindra automation...")
 
         self._stop_event.set()
+        self._stop_browser_ui_watcher()
         self._stop_windows_security_watcher()
         self._running = False
 
